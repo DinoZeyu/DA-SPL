@@ -1,0 +1,20 @@
+{
+  "method": "ieee_da_spl_image_core",
+  "reproduction_status": "paper_guided_reconstruction_with_documented_assumptions",
+  "data_directory": "data/processed/glaucoma_rerun_v1",
+  "pretrained_weights": ".cache/torch/hub/checkpoints/convit_base.pth",
+  "seed": 123,
+  "epochs": 5,
+  "batch_size": 16,
+  "hidden_dim": 512,
+  "attention_heads": 8,
+  "freeze_backbone": true,
+  "learning_rate": 0.0004,
+  "weight_decay": 0.0001,
+  "lambda_parallel": 0.5,
+  "tag_loss_weight": 5.0,
+  "beam_size": 5,
+  "max_decode_steps": 161,
+  "gradient_clip_norm": 5.0,
+  "amp": true
+}

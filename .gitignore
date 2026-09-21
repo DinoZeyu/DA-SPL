@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.conda/
+.cache/
+*.egg-info/
+build/
+dist/
+
+# Local data and generated experiment artifacts
+data/*
+!data/README.md
+iu_10fold/
+checkpoint/
+artifacts/*
+!artifacts/README.md
+*.hdf5
+*.pth
+*.pth.tar
