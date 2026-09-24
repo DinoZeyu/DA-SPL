@@ -1,0 +1,46 @@
+# Interim environment pending the author's GlaBoost code and model requirements.
+# Use Conda for Python; uv manages the locked packages in that environment.
+# Existing environment: conda activate da-spl-repro
+# New machine: conda create -n da-spl-repro -c conda-forge python=3.9.23
+# Then activate it and install without creating a .venv:
+# UV_PROJECT_ENVIRONMENT="$CONDA_PREFIX" uv sync --locked --inexact --python "$CONDA_PREFIX/bin/python"
+# --inexact preserves Conda's own tools and existing unrelated packages.
+# Run commands with the activated Conda environment's python.
+# PyTorch uses CUDA 11.7 wheels; a compatible host driver is needed for GPU use.
+[project]
+name = "glaboost-grape"
+version = "0.1.0"
+description = "Environment for GlaBoost external retrospective validation on GRAPE"
+requires-python = "==3.9.23"
+dependencies = [
+    "numpy==1.23.5",
+    "pandas==2.0.3",
+    "scipy==1.10.1",
+    "scikit-learn==1.3.2",
+    "pyarrow==14.0.2",
+    "pillow==9.5.0",
+    "torch==2.0.1",
+    "torchvision==0.15.2",
+    # The upstream 1.7.6 Linux wheel has cp310 WHEEL tags despite its py3 filename.
+    # It imports on Python 3.9, but pip/uv check report a platform warning.
+    # Repeated uv sync also reinstalls this wheel; this issue is not yet resolved.
+    # Keep the existing model-library version until the author's code is available.
+    "xgboost==1.7.6",
+    "matplotlib==3.7.5",
+    "pyyaml==6.0.2",
+    "tqdm==4.66.5",
+    # GRAPE Excel reader and local PDF inspection, not model inputs.
+    "openpyxl==3.1.5",
+    "pypdf==5.9.0",
+]
+
+[tool.uv]
+package = false
+required-version = ">=0.9.1"
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+no-build = true
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
