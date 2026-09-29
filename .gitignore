@@ -6,7 +6,7 @@ __pycache__/
 .venv/
 venv/
 .conda/
-.cache/
+/.cache
 *.egg-info/
 build/
 dist/
@@ -14,10 +14,10 @@ dist/
 # Local data and generated experiment artifacts
 data/*
 !data/README.md
-iu_10fold/
-checkpoint/
-artifacts/*
-!artifacts/README.md
-*.hdf5
+/artifacts
+# Each generated report stays local; the report index and instructions are tracked.
+result/*
+!result/README.md
+!result/INDEX.md
 *.pth
 *.pth.tar

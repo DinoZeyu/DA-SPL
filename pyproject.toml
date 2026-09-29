@@ -1,4 +1,4 @@
-# Interim environment pending the author's GlaBoost code and model requirements.
+# Paper-based GlaBoost implementation, adapted to GRAPE's available modalities.
 # Use Conda for Python; uv manages the locked packages in that environment.
 # Existing environment: conda activate da-spl-repro
 # New machine: conda create -n da-spl-repro -c conda-forge python=3.9.23
@@ -24,7 +24,7 @@ dependencies = [
     # The upstream 1.7.6 Linux wheel has cp310 WHEEL tags despite its py3 filename.
     # It imports on Python 3.9, but pip/uv check report a platform warning.
     # Repeated uv sync also reinstalls this wheel; this issue is not yet resolved.
-    # Keep the existing model-library version until the author's code is available.
+    # Keep the existing model-library version; this packaging warning is unresolved.
     "xgboost==1.7.6",
     "matplotlib==3.7.5",
     "pyyaml==6.0.2",
@@ -34,11 +34,21 @@ dependencies = [
     "pypdf==5.9.0",
 ]
 
+[project.optional-dependencies]
+# GRAPE has no longitudinal clinical narratives; its default image path needs no mBERT.
+text = ["transformers==4.44.2"]
+
+[build-system]
+requires = ["setuptools==69.5.1", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.uv]
-package = false
+package = true
 required-version = ">=0.9.1"
 environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
-no-build = true
 
 [[tool.uv.index]]
 name = "pypi"
