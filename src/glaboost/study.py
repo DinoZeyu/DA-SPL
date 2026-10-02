@@ -70,12 +70,8 @@ def _check_model_mapping(metadata):
     config = metadata.get("config", {})
     if not config.get("use_image"):
         raise ValueError("This study requires a CFP-based fixed detector.")
-    if any(config.get(k) for k in ("use_text", "use_human_risk", "use_human_confidence")):
-        raise ValueError("GRAPE does not provide the selected text/human modalities.")
-    if config.get("use_structured") and (
-            set(config.get("numeric_features", [])) - {"iop"}
-            or config.get("categorical_features")):
-        raise ValueError("Only contemporaneous IOP is supported as a GRAPE structured predictor.")
+    if any(config.get(k) for k in ("use_text", "use_structured", "use_human_risk", "use_human_confidence")):
+        raise ValueError("This study supports only the image modality.")
 
 
 def write_visit_scores(output, visits, scores, *, model_directory, grape_root,
@@ -158,7 +154,7 @@ def load_verified_scores(scores_path, dataset, grape_root):
     metadata = _read_json(score_metadata_path(scores_path))
     if (metadata.get("format_version") != 1
             or metadata.get("scoring_protocol") != "fixed_detector_independent_visits_v1"):
-        raise ValueError("Unsupported visit-score provenance; regenerate with score-grape.")
+        raise ValueError("Unsupported visit-score provenance; rerun the fixed-detector workflow.")
     if sha256_file(scores_path) != metadata.get("scores_sha256"):
         raise ValueError("Visit-score CSV checksum does not match its provenance sidecar.")
     _check_model_mapping(metadata.get("model_info", {}))

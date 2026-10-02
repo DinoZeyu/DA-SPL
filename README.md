@@ -50,9 +50,6 @@ This produces a **GlaBoost-compatible reconstruction trained on a different sour
 dataset**, not the authors' fitted model or a reproduction of their reported 99%+
 performance.
 
-The previous GRAPE-trained progression experiments have been retired from this
-workflow. Their results are not evidence of external validation.
-
 ## Latest completed primary analysis
 
 This block displays the **predeclared primary model** from the latest completed batch,
@@ -98,9 +95,7 @@ Confidence intervals use paired patient-level bootstrap conditional on fixed out
 
 <!-- glaboost-results:end -->
 
-[All completed validation batches](result/INDEX.md)
-
-## Run source training and GRAPE evaluation
+## Run
 
 From this project directory on your **already allocated GPU node**:
 
@@ -108,142 +103,81 @@ From this project directory on your **already allocated GPU node**:
 bash run_grape.sh
 ```
 
-The default [HF training plan](configs/hf_training.json) fixes the source data,
-ResNet152 encoder and model configurations before examining GRAPE results. The command:
+The script uses the existing `da-spl-repro` Conda environment and visible GPUs. It
+trains the source diagnosis models, reports held-out source metrics, then generates
+GRAPE visit scores, patient-cross-validated progression metrics and cohort reports.
+It requests no resources, installs no packages, creates no venv and has no CPU fallback.
+Offline is the default; `--allow-download` permits missing pretrained encoder weights
+to be downloaded to scratch. Raw datasets are never downloaded or modified.
 
-1. Checks the retained source files and image overlap, then extracts frozen ResNet152 features.
-2. Fits XGBoost diagnosis models using the source training split only and saves their parameters.
-3. Reports diagnosis metrics on the retained source test rows, without using those metrics to select models.
-4. Applies each saved, fixed detector independently to eligible GRAPE visits.
-5. Fits the patient-cross-validated A/B progression mappings and generates the comparison reports.
-
-| Role | Trees | Maximum depth | Learning rate | Row / column subsampling |
-|---|---:|---:|---:|---:|
-| Primary: `paper100_depth6` | 100 | 6 | 0.05 | 1.0 / 1.0 |
-| Supplementary | 100 | 3 | 0.05 | 1.0 / 1.0 |
-| Supplementary | 500 | 3 | 0.05 | 1.0 / 1.0 |
-| Supplementary | 500 | 6 | 0.05 | 1.0 / 1.0 |
-
-All configurations use the same frozen ResNet152 features and seed 42. Each configuration
-produces one diagnosis detector shared across the three GRAPE progression outcomes.
-The primary designation is fixed in advance; no configuration is selected automatically
-from source-test or GRAPE performance. Supplementary comparisons are exploratory.
-
-Optional naming:
+Use `--run-name NAME` for a new output name; existing outputs are never overwritten.
+To evaluate the saved detectors without repeating source training, provide their plan:
 
 ```bash
-bash run_grape.sh --run-name hf_grape_seed42
+bash run_grape.sh --plan result/hf_training/external_models.json --run-name grape_recheck
 ```
 
-The script uses the existing `da-spl-repro` Conda environment and visible GPUs. It does
-not request Slurm resources, create a venv, install packages or fall back to CPU. Offline
-is the default; `--allow-download` explicitly permits missing pretrained encoder weights
-to be fetched into the scratch cache. Original datasets are never downloaded or modified.
-Names are generated automatically when omitted, and existing directories are never
-overwritten. See `bash run_grape.sh --help` for runtime options.
+See `bash run_grape.sh --help` for runtime options. Formal experiments are run by the user.
 
-The source dataset has no usable patient identifiers for verifying patient separation
-between its released training and test splits. Exact decoded-image duplicate checks
-and exclusions provide a limited overlap audit: they cannot establish patient-level independence or
-exclude near-duplicate images. Source-test diagnosis performance and GRAPE progression
-performance answer different questions and are reported separately.
+## Fixed analysis plan
 
-## Use an existing independently trained detector instead
+[configs/hf_training.json](configs/hf_training.json) defines the source and model grid.
+All configurations use frozen ResNet152 features, learning rate 0.05, full row/column
+sampling and seed 42. The source test set and GRAPE never select a detector configuration.
 
-To skip source training, populate [the external model plan](configs/external_models.json)
-and run:
+| Configuration | Trees | Maximum depth | Role |
+|---|---:|---:|---|
+| `paper100_depth6` | 100 | 6 | Predeclared primary |
+| `paper100_depth3` | 100 | 3 | Supplementary |
+| `paper500_depth3` | 500 | 3 | Supplementary |
+| `paper500_depth6` | 500 | 6 | Supplementary |
 
-```bash
-bash run_grape.sh --plan configs/external_models.json
-```
+A uses the latest visit score. B uses the latest score, last-minus-first change,
+OLS slope per year, mean and fraction of scores above 0.5. Both use training-fold
+standardization and balanced L2 logistic regression with C = 1 and decision threshold
+0.5. Requested CV is 3 patient-grouped folds; both eyes and all visits stay together.
+A/B share the same eligible eyes, labels, folds and fixed detector outputs.
 
-This optional plan starts empty. Each detector bundle contains
-native `model.json` and `metadata.json` files from `glaboost.GlaBoost.save()`. The runner
-checks classifier/encoder metadata, checksums, image-only frozen ResNet152 compatibility,
-feature schema and diagnosis label meaning.
+Eyes need at least three original CFP visits. Missing images are omitted; VF values,
+baseline-only OCT, text and clinician ratings are not predictors. PLR2, PLR3 and MD
+slope are evaluated separately. Balanced accuracy and paired B − A are primary;
+AUROC, average precision, sensitivity, specificity and F1 are also reported.
 
-Each entry in `models` must contain:
-
-| Field | Required content |
-|---|---|
-| `name` | Unique name identifying the fitted configuration |
-| `model_directory` | Bundle path; relative paths resolve from the plan file |
-| `training_data.description` | Actual diagnostic training and model-selection data |
-| `training_data.reference` | Dataset revision, training record or other traceable source |
-| `training_data.grape_overlap` | `none`, supported by the supplied training history |
-| `training_data.independence_evidence` | Why training, preprocessing and selection exclude GRAPE |
-
-Set `primary_model` to a listed name before inspecting its GRAPE results. Other models
-are supplementary comparisons. For example, 100/500 trees and depth 3/6 require four
-separately fitted external models. Prediction options cannot change learned trees.
-Do not select the best GRAPE result and describe it as unaffected by that selection.
-
-The runner records supplied independence evidence; checksums establish integrity,
-not patient-level independence. Unknown training provenance cannot enter the declared
-external-validation workflow. Senior bundles with different schemas, label polarity
-or formats need an explicit verified adapter; renaming metadata is insufficient.
-
-## Analysis specification
-
-| Component | Specification |
-|---|---|
-| Cohort | Eyes with at least 3 original CFP visits; actual elapsed time retained |
-| Visit evidence | Source-trained frozen ResNet152 + XGBoost; continuous glaucoma-class output, not a calibrated clinical risk |
-| A: latest | L2 logistic mapping of the latest visit score |
-| B: longitudinal | Latest score, last-minus-first change, OLS slope/year, mean, persistence |
-| Persistence | Fraction of scores strictly above 0.5, fixed in advance |
-| Reference outcomes | PLR2, PLR3 and MD slope evaluated separately |
-| Splitting | Patient-grouped stratified CV; both eyes and all visits stay together |
-| Logistic mappings | Training-fold scaling, balanced class weights, L2, C = 1 |
-| Decisions | Threshold 0.5; class-weighted outputs are not calibrated clinical risks |
-| Primary metric | Balanced accuracy and paired B minus A difference |
-| Other metrics | AUROC, AUPRC (average precision), sensitivity, specificity, F1 |
-| Uncertainty | 2,000 paired patient-bootstrap draws, conditional on fixed OOF predictions |
-| Reproducibility | Seed 42, requested 3 folds, actual memberships and environment saved |
-
-A/B use the same eligible eyes, labels, folds and fixed visit scores. Only the logistic
-mappings are fitted on GRAPE. No GRAPE labels fit or select the diagnosis detector.
-Missing CFP visits are omitted consistently. Baseline OCT, unavailable text and human
-ratings are not synthesized or copied to later visits; VF measurements are not predictors.
-
-This is retrospective assessment. The last CFP can precede the end of the original
-GRAPE label window, which reports disclose. It does not establish a future prediction
-horizon or persistent longitudinal clinical reasoning. Positive, negative and inconclusive
-results are reported alike. CIs exclude model-refitting uncertainty and multiplicity adjustment.
+Intervals use 2,000 paired patient-bootstrap draws conditional on fixed out-of-fold
+predictions; they exclude refitting uncertainty and are not adjusted for multiple
+comparisons. Supplementary configurations are exploratory, with no automatic winner.
+Source patient IDs are unavailable: duplicate checks cannot establish patient separation
+or exclude near duplicates. Diagnosis-test and progression metrics answer different
+questions. Scores are not calibrated clinical risks; assessment is retrospective,
+and the released VF label window can extend beyond the final available CFP.
 
 ## Reports and storage
 
-| Location | Contents |
+Current reports: [HF diagnosis training](result/hf_training/report.html) ·
+[GRAPE comparison](result/grape_validation/report.html) · [Report index](result/INDEX.md).
+The automatic results block above presents the predeclared primary analysis.
+
+| Location for a new run | Contents |
 |---|---|
-| `result/<run>_source/` | Source-training specification, diagnosis-test metrics and overlap/provenance summary |
-| `result/<run>/report.html` and `report.md` | Primary designation and all-configuration comparison |
-| `result/<run>/<model-name>/report.html` | Complete cohort report for each fixed detector |
-| Configuration report directory | Cohort/prevalence, mapping, model/CV specification, metric tables, three-endpoint figure, exclusions, provenance |
-| `result/<run>/` | Immutable plan, status, comparability audit, code snapshot and numeric tables |
-| `artifacts/<run>_source/` | Source-trained model parameters and frozen image features on scratch |
-| `artifacts/<run>/` | GRAPE visit scores, fitted progression mappings and numerical artifacts on scratch |
-| Supplied external model directories | Optional existing model parameters; not refitted or overwritten during validation |
+| `result/<run>_source/` | Source counts, exclusions, diagnosis metrics and training provenance |
+| `result/<run>/` | All-configuration comparison, per-model cohort reports, figures, CSV/JSON audit records and code snapshot |
+| `artifacts/<run>_source/` | Trained diagnosis models and frozen image features |
+| `artifacts/<run>/` | GRAPE visit scores and fitted progression mappings |
 
-Reports remain in home. `artifacts` and `.cache` point to `/scratch/users/zeyuhan/DA-SPL/`;
-store all model parameters there as well. `data/raw/grape` points to the preserved raw
-cohort. HF raw data, PDFs, Git history and the Conda environment are protected during cleanup.
+Reports stay in home. `artifacts` and `.cache` point to `/scratch/users/zeyuhan/DA-SPL/`.
+Current report folders have shorter display names; their recorded run IDs and scratch
+artifact paths remain unchanged. Raw data, PDFs, Git history and Conda are retained.
 
-## Environment and reusable code
+## Environment
 
-Use Conda for Python and uv for locked packages, without creating a venv:
+Conda provides Python 3.9.23; uv locks dependencies without creating a venv:
 
 ```bash
 conda activate da-spl-repro
 UV_PROJECT_ENVIRONMENT="$CONDA_PREFIX" UV_CACHE_DIR="$PWD/.cache/uv" uv sync --locked --inexact --python "$CONDA_PREFIX/bin/python"
 ```
 
-Python 3.9.23 and package versions are pinned in `pyproject.toml` and `uv.lock`.
-The existing XGBoost 1.7.6 wheel has an upstream Python-tag packaging warning; repeated
-uv sync may reinstall it. The wrapper does not run environment synchronization.
-
-`src/glaboost/` contains source diagnosis training, fixed-model scoring, raw-data mapping,
-longitudinal evaluation, GPU numerical routines, provenance and reporting. `external.py`
-runs the fixed-model evaluation plan. Development tests use temporary synthetic data only.
-`Glaboost_CH.py` remains the senior-code reference; its original ResNet18 multimodal
-interface is not the GRAPE validation entry point. Obsolete GRAPE-label XGBoost training
-and internal tree-comparison entry points have been removed.
+The wrapper uses the installed environment and does not synchronize it. The pinned
+XGBoost 1.7.6 wheel has an upstream Python-tag warning; uv may reinstall it during sync.
+Reusable source training, fixed scoring, longitudinal evaluation and reporting code
+lives in `src/glaboost/`. Software tests use temporary synthetic data.

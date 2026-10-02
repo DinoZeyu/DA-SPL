@@ -73,7 +73,7 @@ def _visit_model_description(evaluation, provenance):
     config = info.get("config", {}) or {}
     spec = info.get("encoder_spec", {}) or (info.get("encoder_specs") or {}).get("image", {}) or {}
     encoder = config.get("image_encoder", spec.get("encoder", "not recorded"))
-    encoder_name = {"resnet18": "ResNet18", "resnet152": "ResNet152"}.get(encoder, str(encoder))
+    encoder_name = "ResNet152" if encoder == "resnet152" else str(encoder)
     dimension = spec.get("output_dim", "not recorded")
     dimension = format(dimension, ",") if isinstance(dimension, int) else str(dimension)
     keys = ("n_estimators", "max_depth", "learning_rate", "subsample", "colsample_bytree", "reg_lambda", "reg_alpha")
@@ -84,8 +84,7 @@ def _visit_model_description(evaluation, provenance):
         settings["reg_lambda"] = config.get("reg_lambda", 1.)
         settings["reg_alpha"] = config.get("reg_alpha", 0.)
     source = spec.get("source", {}) or {}
-    official = {"resnet152": ("ResNet152_Weights.IMAGENET1K_V1", "394f9c45"),
-                "resnet18": ("ResNet18_Weights.IMAGENET1K_V1", "f37072fd")}.get(encoder)
+    official = ("ResNet152_Weights.IMAGENET1K_V1", "394f9c45") if encoder == "resnet152" else None
     imagenet = bool(official and source.get("kind") == "torchvision"
                     and source.get("weights") == official[0]
                     and str(source.get("sha256", "")).startswith(official[1]))

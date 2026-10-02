@@ -1,7 +1,7 @@
 """Paper-based, reusable GlaBoost for independent glaucoma diagnosis visits."""
 
 from .config import GlaBoostConfig
-from .data import GrapeDataset, VisitInput, load_grape, load_jsonl
+from .data import GrapeDataset, VisitInput, load_grape
 from .model import GlaBoost
 
-__all__ = ["GlaBoost", "GlaBoostConfig", "GrapeDataset", "VisitInput", "load_grape", "load_jsonl"]
+__all__ = ["GlaBoost", "GlaBoostConfig", "GrapeDataset", "VisitInput", "load_grape"]

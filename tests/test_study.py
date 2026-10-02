@@ -237,14 +237,21 @@ class StudyTests(unittest.TestCase):
 
     def test_cli_weight_cache_cannot_write_into_raw_data(self):
         from glaboost.cli import main
-        with patch("glaboost.cli.load_grape", return_value=self.dataset), \
-                patch("glaboost.cli.GlaBoost.load") as load_model, redirect_stderr(io.StringIO()):
+        plan = self.directory / "existing_models.json"
+        plan.write_text(json.dumps({"format_version": 1, "primary_model": "fixture", "models": [
+            {"name": "fixture", "model_directory": str(self.model), "training_data": {
+                "description": "SYNTHETIC independent diagnosis fixture", "reference": "SYNTHETIC fixture",
+                "grape_overlap": "none", "independence_evidence": "SYNTHETIC no-overlap test declaration"}}]}))
+        with patch("glaboost.external.GlaBoost.load") as load_model, redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as caught:
-                main(["score-grape", "--root", str(self.root), "--model", str(self.model),
-                      "--output", str(self.scores_path), "--cache-dir", str(self.root / "cache"),
+                main(["validate-grape", "--plan", str(plan), "--root", str(self.root),
+                      "--run-name", "reject_raw_cache", "--result-dir", str(self.directory / "result"),
+                      "--artifact-dir", str(self.directory / "artifacts"), "--cache-dir", str(self.root / "cache"),
                       "--allow-download"])
         self.assertEqual(caught.exception.code, 2)
         load_model.assert_not_called()
+        self.assertFalse((self.directory / "result").exists())
+        self.assertFalse((self.directory / "artifacts").exists())
 
     def test_root_readme_updates_only_designated_block_and_default_result(self):
         readme = self.directory / "README.md"

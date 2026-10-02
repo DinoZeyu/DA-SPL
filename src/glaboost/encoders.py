@@ -1,4 +1,4 @@
-"""Frozen image/text encoders for the documented GlaBoost method variants.
+"""Frozen ResNet152 image encoder for the GRAPE validation pipeline.
 
 Networks are loaded on the first nonempty ``transform`` call. Downloads require
 an explicit opt-in; the default cache belongs to this project, not the user home.
@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import re
-import unicodedata
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
@@ -23,12 +21,6 @@ _DEFAULT_CACHE = Path(__file__).resolve().parents[2] / ".cache" / "glaboost"
 _RESNET_URL = "https://download.pytorch.org/models/resnet152-394f9c45.pth"
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
-_PUNCTUATION = str.maketrans({
-    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
-    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
-    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-",
-    "\u2014": "-", "\u2015": "-", "\u2212": "-", "\u2026": "...",
-})
 
 
 def _positive_integer(value: int, name: str) -> int:
@@ -49,20 +41,6 @@ def _resnet152_uninitialized():
     from torchvision.models import resnet152
 
     return resnet152(weights=None)
-
-
-def _resnet18_uninitialized():
-    from torchvision.models import resnet18
-
-    return resnet18(weights=None)
-
-
-def _transformer_classes():
-    try:
-        from transformers import AutoModel, AutoTokenizer
-    except ImportError as exc:
-        raise ImportError("MBERTEncoder requires the project's transformers dependency") from exc
-    return AutoModel, AutoTokenizer
 
 
 def _rows(inputs: Sequence[Any]) -> list:
@@ -112,17 +90,6 @@ def _runtime_spec(requested_device, resolved_device, gpu_ids, batch_size):
     }
 
 
-def normalize_rim_text(text: str) -> str:
-    """Normalize Unicode, punctuation, case, and whitespace without inventing text."""
-    if not isinstance(text, str):
-        raise ValueError("Rim text must be a nonempty string; missing text is not imputed")
-    normalized = unicodedata.normalize("NFKC", text).translate(_PUNCTUATION).lower()
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    if not normalized:
-        raise ValueError("Rim text must be nonempty; missing text is not imputed")
-    return normalized
-
-
 class ResNet152Encoder:
     """ImageNet-1K V1 ResNet152 global-average-pool embeddings (2048 values).
 
@@ -142,7 +109,6 @@ class ResNet152Encoder:
     checkpoint_sha256_prefix = "394f9c45"
     weights_url = _RESNET_URL
     weights_name = "ResNet152_Weights.IMAGENET1K_V1"
-    normalize_image = True
 
     @staticmethod
     def _build_model():
@@ -221,8 +187,7 @@ class ResNet152Encoder:
             raise ValueError("Image must be a path, encoded bytes, or PIL image; missing images are not imputed")
         image = image.resize((224, 224), resample=Image.Resampling.BILINEAR)
         array = np.array(image, dtype=np.float32, copy=True) / np.float32(255.0)
-        if cls.normalize_image:
-            array = (array - np.asarray(_IMAGENET_MEAN, dtype=np.float32)) / np.asarray(_IMAGENET_STD, dtype=np.float32)
+        array = (array - np.asarray(_IMAGENET_MEAN, dtype=np.float32)) / np.asarray(_IMAGENET_STD, dtype=np.float32)
         return torch.from_numpy(array.transpose(2, 0, 1).copy())
 
     def transform(self, inputs: Sequence[Any]) -> np.ndarray:
@@ -260,176 +225,13 @@ class ResNet152Encoder:
             "cache_dir": str(self.cache_dir),
             **_runtime_spec(self.device, self._resolved_device, self._gpu_ids, self.batch_size),
             "preprocessing": {"color": "RGB", "resize": [224, 224], "interpolation": "bilinear",
-                              "scale": "divide_by_255", "mean": list(_IMAGENET_MEAN) if self.normalize_image else None,
-                              "std": list(_IMAGENET_STD) if self.normalize_image else None, "augmentation": False},
+                              "scale": "divide_by_255", "mean": list(_IMAGENET_MEAN),
+                              "std": list(_IMAGENET_STD), "augmentation": False},
         }
-
-
-class ResNet18Encoder(ResNet152Encoder):
-    """Senior notebook image branch: frozen ImageNet V1 ResNet18, 512 values.
-
-    The notebook uses PIL RGB images, Resize((224, 224)) and ToTensor without
-    ImageNet mean/std normalization. This intentionally preserves that recipe.
-    Weight validation, lazy loading and multi-GPU execution match ResNet152.
-    """
-
-    output_dim = 512
-    encoder_name = "resnet18"
-    display_name = "ResNet18"
-    checkpoint_filename = "resnet18-f37072fd.pth"
-    checkpoint_sha256_prefix = "f37072fd"
-    weights_url = "https://download.pytorch.org/models/resnet18-f37072fd.pth"
-    weights_name = "ResNet18_Weights.IMAGENET1K_V1"
-    normalize_image = False
-
-    @staticmethod
-    def _build_model():
-        return _resnet18_uninitialized()
 
 
 def image_encoder_class(name):
     """Resolve a configured image encoder without loading weights or CUDA."""
     if name == "resnet152":
         return ResNet152Encoder
-    if name == "resnet18":
-        return ResNet18Encoder
-    raise ValueError("image encoder must be resnet152 or resnet18")
-
-
-class MBERTEncoder:
-    """Frozen uncased multilingual BERT with attention-mask mean pooling.
-
-    The paper does not specify treatment of special tokens in mean pooling. This
-    implementation includes [CLS] and [SEP] and excludes all padding tokens.
-    ``auto`` uses the first visible CUDA GPU or CPU; this optional encoder is
-    deliberately single-device even when the image encoder uses several GPUs.
-    """
-
-    output_dim = 768
-
-    def __init__(self, *, model_name: str = "google-bert/bert-base-multilingual-uncased",
-                 revision: Optional[str] = None, cache_dir: Optional[Union[str, Path]] = None,
-                 device: str = "cpu", batch_size: int = 16, max_length: int = 128,
-                 allow_download: bool = False):
-        if not isinstance(model_name, str) or not model_name.strip():
-            raise ValueError("model_name must identify pretrained mBERT weights or a local model directory")
-        self.model_name = model_name
-        self.revision = revision
-        self.cache_dir = Path(cache_dir).expanduser().resolve() if cache_dir is not None else _DEFAULT_CACHE
-        self.device = str(device)
-        self.batch_size = _positive_integer(batch_size, "batch_size")
-        self.max_length = _positive_integer(max_length, "max_length")
-        if not 3 <= self.max_length <= 512:
-            raise ValueError("max_length must be between 3 and 512; the main method uses 128")
-        self.allow_download = bool(allow_download)
-        self._model = None
-        self._tokenizer = None
-        self._source = None
-        self._resolved_device = None
-        self._gpu_ids = ()
-
-    def _load(self) -> None:
-        if self._model is not None:
-            return
-        self._resolved_device, gpu_ids = resolve_image_devices(self.device)
-        self._gpu_ids = gpu_ids[:1]
-        AutoModel, AutoTokenizer = _transformer_classes()
-        kwargs = {
-            "cache_dir": str(self.cache_dir / "huggingface"),
-            "revision": self.revision,
-            "local_files_only": not self.allow_download,
-            "trust_remote_code": False,
-        }
-        try:
-            model, loading_info = AutoModel.from_pretrained(
-                self.model_name, add_pooling_layer=False, output_loading_info=True, **kwargs,
-            )
-            if loading_info.get("missing_keys") or loading_info.get("mismatched_keys") or loading_info.get("error_msgs"):
-                raise ValueError(f"Incomplete pretrained mBERT checkpoint; refusing random parameter initialization: {loading_info}")
-            if getattr(model.config, "model_type", None) != "bert" or model.config.hidden_size != self.output_dim:
-                raise ValueError("The mBERT encoder requires a BERT checkpoint with hidden_size=768")
-            commit = getattr(model.config, "_commit_hash", None)
-            tokenizer_kwargs = dict(kwargs)
-            if commit:
-                tokenizer_kwargs["revision"] = commit
-            tokenizer = AutoTokenizer.from_pretrained(self.model_name, **tokenizer_kwargs)
-        except OSError as exc:
-            raise FileNotFoundError(
-                f"Could not load pretrained mBERT '{self.model_name}' from {self.cache_dir / 'huggingface'}. "
-                f"allow_download={self.allow_download}; supply a complete local model or explicitly enable downloading."
-            ) from exc
-        model.requires_grad_(False)
-        model.eval()
-        model.to(self._resolved_device)
-        local_dir = Path(self.model_name).expanduser()
-        hashes = None
-        if local_dir.is_dir():
-            hashes = {str(path.relative_to(local_dir)): _sha256(path)
-                      for path in sorted(local_dir.rglob("*")) if path.is_file()
-                      and path.suffix in {".json", ".txt", ".bin", ".safetensors"}}
-            fingerprint = "sha256:" + hashlib.sha256(
-                json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            ).hexdigest()
-            resolved_revision = None
-        else:
-            resolved_revision = commit
-            if not resolved_revision and self.revision and re.fullmatch(r"[0-9a-fA-F]{40}", self.revision):
-                resolved_revision = self.revision
-            if not resolved_revision:
-                raise ValueError("mBERT checkpoint has no resolved commit; specify an exact Hugging Face commit revision")
-            fingerprint = "hf_commit:" + resolved_revision
-        self._source = {"model_name": self.model_name, "requested_revision": self.revision,
-                        "resolved_commit": commit, "local_file_sha256": hashes,
-                        "fingerprint": fingerprint, "resolved_revision": resolved_revision,
-                        "ignored_checkpoint_keys": list(loading_info.get("unexpected_keys", []))}
-        self._model, self._tokenizer = model, tokenizer
-
-    def transform(self, inputs: Sequence[str]) -> np.ndarray:
-        rows = _rows(inputs)
-        normalized = []
-        for index, value in enumerate(rows):
-            try:
-                normalized.append(normalize_rim_text(value))
-            except ValueError as exc:
-                raise ValueError(f"Invalid rim text at row {index}: {exc}") from exc
-        if not normalized:
-            return np.empty((0, self.output_dim), dtype=np.float32)
-        import torch
-
-        self._load()
-        self._model.eval()
-        outputs = []
-        with torch.no_grad():
-            for start in range(0, len(normalized), self.batch_size):
-                batch = normalized[start:start + self.batch_size]
-                tokens = self._tokenizer(batch, padding=True, truncation=True,
-                                         max_length=self.max_length, return_tensors="pt",
-                                         return_attention_mask=True)
-                tokens = {key: value.to(self._resolved_device) for key, value in tokens.items()}
-                hidden = self._model(**tokens).last_hidden_state
-                mask = tokens["attention_mask"].unsqueeze(-1).to(dtype=hidden.dtype)
-                counts = mask.sum(dim=1)
-                if torch.any(counts == 0):
-                    raise ValueError("Tokenizer returned a sample without any unmasked tokens")
-                pooled = (hidden * mask).sum(dim=1) / counts
-                if tuple(pooled.shape) != (len(batch), self.output_dim):
-                    raise ValueError(f"mBERT returned unexpected shape {tuple(pooled.shape)}")
-                outputs.append(pooled.detach().cpu().numpy().astype(np.float32, copy=False))
-        return np.concatenate(outputs, axis=0)
-
-    def spec(self) -> dict:
-        return {
-            "encoder": "mbert", "output_dim": self.output_dim, "frozen": True,
-            "loaded": self._model is not None,
-            "fingerprint": self._source["fingerprint"] if self._source is not None else None,
-            "resolved_revision": self._source["resolved_revision"] if self._source is not None else None,
-            "source": dict(self._source) if self._source is not None else None,
-            "requested_model_name": self.model_name, "requested_revision": self.revision,
-            "cache_dir": str(self.cache_dir),
-            **_runtime_spec(self.device, self._resolved_device, self._gpu_ids, self.batch_size),
-            "preprocessing": {"unicode": "NFKC", "punctuation": "curly_quotes_dashes_ellipsis_to_ascii",
-                              "lowercase": True, "collapse_whitespace": True,
-                              "max_length": self.max_length, "truncation": True,
-                              "pooling": "attention_mask_mean", "include_special_tokens": True,
-                              "special_token_policy_is_assumption": True},
-        }
+    raise ValueError("image encoder must be resnet152")

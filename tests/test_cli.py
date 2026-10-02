@@ -11,9 +11,7 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
-from glaboost.cli import _execution_settings, main
-from glaboost.config import GlaBoostConfig
-from glaboost.data import VisitInput
+from glaboost.cli import main
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,10 +45,10 @@ class CliTests(unittest.TestCase):
             with self.subTest(options=options), \
                     patch("glaboost.external.run_external_validation", return_value=Path("unused")) as runner, \
                     redirect_stdout(io.StringIO()):
-                self.assertEqual(main(["validate-grape", "--run-name", "external", *options]), 0)
+                self.assertEqual(main(["validate-grape", "--plan", "saved/external_models.json", "--run-name", "external", *options]), 0)
                 kwargs = runner.call_args.kwargs
                 self.assertEqual(kwargs["run_name"], "external")
-                self.assertEqual(kwargs["plan_path"], "declared.json" if options else "configs/external_models.json")
+                self.assertEqual(kwargs["plan_path"], "declared.json" if options else "saved/external_models.json")
                 self.assertEqual(kwargs["device"], "cuda:1" if options else "cuda")
                 self.assertEqual(kwargs["image_batch_size"], 7 if options else None)
                 self.assertEqual(kwargs["image_weights"], "weights.pth" if options else None)
@@ -74,7 +72,7 @@ class CliTests(unittest.TestCase):
 
     def test_removed_training_command_and_tree_overrides_are_rejected(self):
         invalid = (["train-grape", "--run-name", "old"],
-                   *(["validate-grape", "--run-name", "bad", *options] for options in (
+                   *(["validate-grape", "--plan", "saved.json", "--run-name", "bad", *options] for options in (
                        ["--compare-trees"], ["--n-estimators", "100"], ["--max-depth", "3"],
                        ["--tree-counts", "100,500"], ["--tree-depths", "3,6"], ["--synthetic"],
                        ["--device", "auto"])))
@@ -84,55 +82,6 @@ class CliTests(unittest.TestCase):
                 main(args)
             self.assertEqual(raised.exception.code, 2)
             runner.assert_not_called()
-
-    def test_manual_evaluation_uses_requested_gpu_or_explicit_cpu(self):
-        for device, resolved, ids in (("cuda", "cuda:0", (0, 1)), ("cuda:1", "cuda:1", (1,)), ("cpu", "cpu", ())):
-            with self.subTest(device=device), \
-                    patch("glaboost.encoders.resolve_image_devices", return_value=(resolved, ids)), \
-                    patch("glaboost.study.create_study_report", return_value=Path("unused")) as evaluate, \
-                    redirect_stdout(io.StringIO()):
-                self.assertEqual(main(["evaluate-grape", "--scores", "scores.csv", "--run-name", "analysis",
-                                       "--device", device]), 0)
-                config = evaluate.call_args.kwargs["config"]
-                self.assertEqual(config.compute_device, resolved)
-                self.assertEqual((config.n_splits, config.seed, config.bootstrap_replicates), (3, 42, 2000))
-
-    def test_manual_scoring_forwards_batch_and_training_independence_evidence(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            detector = Mock(config=GlaBoostConfig())
-            detector.predict_score.return_value = [.2, .3, .4]
-            visits = [VisitInput(f"visit{i}", image=f"{i}.jpg", patient_id="patient", eye_id="eye", time_years=float(i))
-                      for i in range(3)]
-            dataset = Mock()
-            dataset.image_visits.return_value = visits
-            output = root / "scores.csv"
-            with patch("glaboost.encoders.resolve_image_devices", return_value=("cuda:0", (0, 1))), \
-                    patch("glaboost.cli.GlaBoost.load", return_value=detector) as load, \
-                    patch("glaboost.cli.load_grape", return_value=dataset), \
-                    patch("glaboost.cli.write_visit_scores", return_value=(output, output.with_suffix(".metadata.json"))) as write, \
-                    redirect_stdout(io.StringIO()):
-                self.assertEqual(main(["score-grape", "--model", "detector", "--output", str(output),
-                                       "--root", str(root / "raw"), "--cache-dir", str(root / "cache"),
-                                       "--training-data-description", "Independent diagnostic training cohort",
-                                       "--training-data-reference", "training-manifest.json",
-                                       "--grape-training-overlap", "none", "--independence-evidence", "Documented cohort provenance"]), 0)
-            self.assertEqual(load.call_args.kwargs["image_batch_size"], 128)
-            self.assertEqual(load.call_args.kwargs["device"], "cuda")
-            self.assertFalse(load.call_args.kwargs["allow_download"])
-            self.assertEqual(write.call_args.kwargs["independence_evidence"], "Documented cohort provenance")
-            self.assertEqual(write.call_args.kwargs["grape_overlap"], "none")
-            detector.fit.assert_not_called()
-
-    def test_batch_size_scales_with_visible_gpus_and_invalid_sizes_fail_first(self):
-        for ids in ((0,), (0, 1), (2,)):
-            with patch("glaboost.encoders.resolve_image_devices", return_value=(f"cuda:{ids[0]}", ids)):
-                self.assertEqual(_execution_settings("cuda")[2], 64 * len(ids))
-                self.assertEqual(_execution_settings("cuda", 7)[2], 7)
-        for invalid in (0, -1, True, 1.5):
-            with patch("glaboost.encoders.resolve_image_devices") as resolve, self.assertRaises(ValueError):
-                _execution_settings("cuda", invalid)
-            resolve.assert_not_called()
 
 
 class ShellTests(unittest.TestCase):

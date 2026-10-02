@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from importlib.metadata import PackageNotFoundError
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -14,21 +13,20 @@ from glaboost import GlaBoost, GlaBoostConfig, VisitInput
 
 
 class TinyEncoder:
-    output_dim = 2
+    output_dim = 2048
 
-    def __init__(self, text=False):
-        self.text = text
+    def __init__(self):
         self.fingerprint = "tiny-test-fixture"
 
     def transform(self, inputs):
-        if self.text:
-            return np.array([[len(v), len(v) / 2] for v in inputs], dtype=np.float32)
-        return np.asarray(inputs, dtype=np.float32)
+        features = np.zeros((len(inputs), self.output_dim), dtype=np.float32)
+        features[:, :2] = np.asarray(inputs, dtype=np.float32)
+        return features
 
     def spec(self):
-        return {"fingerprint": self.fingerprint, "resolved_revision": None,
-                "encoder": "tiny", "output_dim": self.output_dim,
-                "preprocessing": {"fixture": True}}
+        return {"fingerprint": self.fingerprint, "frozen": True,
+                "encoder": "resnet152", "output_dim": self.output_dim,
+                "preprocessing": {"fixture": True, "purpose": "SYNTHETIC SOFTWARE TEST ONLY"}}
 
 
 class GlaBoostTests(unittest.TestCase):
@@ -69,11 +67,10 @@ class GlaBoostTests(unittest.TestCase):
             human={"glaucoma_risk_assessment": "high" if i % 2 else "low", "confidence_level": .8},
         ) for i in range(16)]
         self.y = np.asarray([i % 2 for i in range(16)])
-        self.config = GlaBoostConfig(
-            use_image=False, use_structured=True,
-            numeric_features=("iop",), categorical_features=("status",),
-            n_estimators=3, max_depth=2,
-        )
+        self.config = GlaBoostConfig(n_estimators=3, max_depth=2)
+
+    def model(self):
+        return GlaBoost(self.config, image_encoder=TinyEncoder())
 
     def test_paper_parameters_and_grape_default(self):
         c = GlaBoostConfig()
@@ -82,31 +79,31 @@ class GlaBoostTests(unittest.TestCase):
         self.assertEqual((c.learning_rate, c.max_depth, c.n_estimators, c.text_max_length), (.05, 6, 100, 128))
 
     def test_inference_is_visit_independent_and_does_not_refit(self):
-        model = GlaBoost(self.config).fit(self.visits, self.y)
-        before = model._structured.to_dict()
+        model = self.model().fit(self.visits, self.y)
+        before = bytes(model.classifier_.get_booster().save_raw())
         scores = model.predict_score(self.visits)
         singles = [model.predict_score([visit])[0] for visit in self.visits]
         np.testing.assert_allclose(scores, singles)
         modified = replace(self.visits[0], structured={"iop": 1000., "status": "new"})
         model.predict_score([modified])
-        self.assertEqual(before, model._structured.to_dict())
+        self.assertEqual(before, bytes(model.classifier_.get_booster().save_raw()))
         probabilities = model.predict_proba(self.visits)
         np.testing.assert_allclose(probabilities.sum(axis=1), 1.)
         np.testing.assert_array_equal(model.predict(self.visits), probabilities[:, 1] >= .5)
 
     def test_disabled_human_text_and_metadata_are_not_features(self):
-        model = GlaBoost(self.config).fit(self.visits, self.y)
-        changed = [replace(v, text="diagnosis label text", human={"target": 999},
+        model = self.model().fit(self.visits, self.y)
+        changed = [replace(v, text="diagnosis label text", human={"target": 999}, structured={"plr2": 1, "iop": 999},
                            patient_id="another", time_years=999.) for v in self.visits]
         np.testing.assert_array_equal(model.transform(self.visits), model.transform(changed))
-        self.assertTrue(all(name.startswith("structured::") for name in model.feature_names_))
+        self.assertEqual(model.feature_names_, [f"image_{i}" for i in range(2048)])
 
     def test_native_json_round_trip(self):
-        model = GlaBoost(self.config).fit(self.visits, self.y)
+        model = self.model().fit(self.visits, self.y)
         with tempfile.TemporaryDirectory() as root:
             output = Path(root) / "model"
             model.save(output)
-            restored = GlaBoost.load(output)
+            restored = GlaBoost.load(output, image_encoder=TinyEncoder())
             self.assertEqual(restored.classifier_.get_params()["predictor"], "cpu_predictor")
             self.assertEqual(restored.classifier_.get_params()["gpu_id"], -1)
             np.testing.assert_allclose(model.predict_proba(self.visits), restored.predict_proba(self.visits))
@@ -122,7 +119,7 @@ class GlaBoostTests(unittest.TestCase):
                 GlaBoost.load(output)
 
     def test_loaded_classifier_uses_runtime_device_without_changing_learned_settings(self):
-        original = GlaBoost(self.config).fit(self.visits, self.y)
+        original = self.model().fit(self.visits, self.y)
         with tempfile.TemporaryDirectory() as root:
             output = Path(root) / "model"
             original.save(output)
@@ -145,7 +142,7 @@ class GlaBoostTests(unittest.TestCase):
                     classifier.predict_proba.return_value = np.tile([.25, .75], (len(self.visits), 1))
                     with patch("glaboost.model.XGBClassifier", return_value=classifier), \
                             patch("glaboost.model.resolve_image_devices", return_value=(resolved, gpu_ids)):
-                        restored = GlaBoost.load(output, device=device)
+                        restored = GlaBoost.load(output, device=device, image_encoder=TinyEncoder())
                     classifier.set_params.assert_called_once_with(
                         n_jobs=training_config.n_jobs, predictor=predictor, gpu_id=gpu_id)
                     self.assertEqual(restored.training_config_, training_config)
@@ -163,7 +160,7 @@ class GlaBoostTests(unittest.TestCase):
                     classifier.predict_proba.assert_not_called()
 
     def test_gpu_load_rejects_cpu_fallback_and_unavailable_device(self):
-        original = GlaBoost(self.config).fit(self.visits, self.y)
+        original = self.model().fit(self.visits, self.y)
         with tempfile.TemporaryDirectory() as root:
             output = Path(root) / "model"
             original.save(output)
@@ -175,20 +172,21 @@ class GlaBoostTests(unittest.TestCase):
             with patch("glaboost.model.XGBClassifier", return_value=classifier), \
                     patch("glaboost.model.resolve_image_devices", return_value=("cuda:0", (0, 1))):
                 with self.assertRaisesRegex(RuntimeError, "CPU fallback"):
-                    GlaBoost.load(output, device="cuda")
+                    GlaBoost.load(output, device="cuda", image_encoder=TinyEncoder())
             with patch("glaboost.model.resolve_image_devices", side_effect=RuntimeError("CUDA unavailable")), \
                     patch("glaboost.model.XGBClassifier") as constructor:
                 with self.assertRaisesRegex(RuntimeError, "CUDA unavailable"):
-                    GlaBoost.load(output, device="cuda")
+                    GlaBoost.load(output, device="cuda", image_encoder=TinyEncoder())
                 constructor.assert_not_called()
 
     def test_runtime_batch_and_cache_overrides_preserve_resaved_training_provenance(self):
-        original = GlaBoost(self.config).fit(self.visits, self.y)
+        original = self.model().fit(self.visits, self.y)
         with tempfile.TemporaryDirectory() as root:
             output, resaved = Path(root) / "model", Path(root) / "resaved"
             original.save(output)
             metadata = json.loads((output / "metadata.json").read_text())
-            restored = GlaBoost.load(output, device="cpu", image_batch_size=128, cache_dir=str(Path(root) / "cache"))
+            restored = GlaBoost.load(output, device="cpu", image_batch_size=128,
+                                     cache_dir=str(Path(root) / "cache"), image_encoder=TinyEncoder())
             self.assertEqual(restored.config.image_batch_size, 128)
             self.assertEqual(restored.training_config_, self.config)
             restored.save(resaved)
@@ -199,23 +197,18 @@ class GlaBoostTests(unittest.TestCase):
             np.testing.assert_array_equal(original.predict_score(self.visits), restored.predict_score(self.visits))
             for invalid in (0, -1, True, 1.5):
                 with self.subTest(batch=invalid), self.assertRaisesRegex(ValueError, "image_batch_size"):
-                    GlaBoost.load(output, image_batch_size=invalid)
+                    GlaBoost.load(output, image_batch_size=invalid, image_encoder=TinyEncoder())
 
-    def test_fusion_order_and_encoder_identity_round_trip(self):
-        c = replace(self.config, use_image=True, use_text=True,
-                    use_human_risk=True, use_human_confidence=True)
-        image, text = TinyEncoder(), TinyEncoder(text=True)
-        model = GlaBoost(c, image_encoder=image, text_encoder=text).fit(self.visits, self.y)
+    def test_image_schema_and_encoder_identity_round_trip(self):
+        image = TinyEncoder()
+        model = GlaBoost(self.config, image_encoder=image).fit(self.visits, self.y)
         names = model.feature_names_
-        self.assertEqual(names[:2], ["text_0", "text_1"])
-        self.assertTrue(names[2].startswith("structured::"))
-        self.assertLess(next(i for i,n in enumerate(names) if n.startswith("structured::")),
-                        next(i for i,n in enumerate(names) if n.startswith("human::")))
-        self.assertEqual(names[-2:], ["image_0", "image_1"])
+        self.assertEqual(names[:2], ["image_0", "image_1"])
+        self.assertEqual(names[-2:], ["image_2046", "image_2047"])
         with tempfile.TemporaryDirectory() as root:
             output = Path(root) / "model"
             model.save(output)
-            restored = GlaBoost.load(output, image_encoder=image, text_encoder=text)
+            restored = GlaBoost.load(output, image_encoder=image)
             np.testing.assert_allclose(model.predict_score(self.visits), restored.predict_score(self.visits))
             image.fingerprint = "different-weights"
             with self.assertRaisesRegex(ValueError, "weights or preprocessing differ"):
@@ -229,37 +222,35 @@ class GlaBoostTests(unittest.TestCase):
         encoder = TinyEncoder()
         shared_spec = encoder.spec()
         encoder.spec = lambda: shared_spec
-        c = replace(self.config, use_image=True, use_structured=False)
-        model = GlaBoost(c, image_encoder=encoder).fit(self.visits, self.y)
+        model = GlaBoost(self.config, image_encoder=encoder).fit(self.visits, self.y)
         shared_spec["preprocessing"]["fixture"] = False
         with self.assertRaisesRegex(ValueError, "weights or preprocessing differ"):
             model.predict_score(self.visits)
 
-    def test_injected_text_encoder_does_not_require_optional_transformers_package(self):
-        model = GlaBoost(replace(self.config, use_text=True), text_encoder=TinyEncoder(text=True))
-        model.fit(self.visits, self.y)
-        with tempfile.TemporaryDirectory() as root, \
-             patch("glaboost.model.version", side_effect=PackageNotFoundError):
-            model.save(Path(root) / "model")
-            metadata = json.loads((Path(root) / "model" / "metadata.json").read_text())
-            self.assertIsNone(metadata["versions"]["transformers"])
+    def test_legacy_disabled_metadata_round_trips_but_cannot_enable_old_branches(self):
+        legacy = json.loads(json.dumps(self.config.to_dict()))
+        restored = GlaBoostConfig.from_dict(legacy)
+        self.assertEqual(json.loads(json.dumps(restored.to_dict())), legacy)
+        self.assertEqual(GlaBoostConfig.for_image_method().image_encoder, "resnet152")
+        with self.assertRaises(ValueError):
+            GlaBoostConfig.for_image_method("ch")
+        for changes in ({"image_encoder": "resnet18"}, {"use_image": False},
+                        {"use_text": True}, {"use_structured": True},
+                        {"use_human_risk": True}, {"use_human_confidence": True}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                GlaBoostConfig.from_dict(dict(legacy, **changes))
 
     def test_bad_inputs_fail_before_network_loading(self):
         with self.assertRaisesRegex(ValueError, "Missing enabled image"):
             GlaBoost().fit([VisitInput("one"), VisitInput("two")], [0, 1])
         with self.assertRaisesRegex(ValueError, "unique"):
-            GlaBoost(self.config).fit([self.visits[0], self.visits[0]], [0, 1])
+            self.model().fit([self.visits[0], self.visits[0]], [0, 1])
         with self.assertRaises(ValueError):
-            GlaBoost(self.config).fit(self.visits, np.arange(len(self.visits)))
+            self.model().fit(self.visits, np.arange(len(self.visits)))
         with self.assertRaises(ValueError):
-            GlaBoost(self.config).fit(self.visits, self.y, sample_weight=np.full(len(self.visits), -1))
+            self.model().fit(self.visits, self.y, sample_weight=np.full(len(self.visits), -1))
         with self.assertRaises(RuntimeError):
-            GlaBoost(self.config).predict_score(self.visits)
-        with self.assertRaises(ValueError):
-            GlaBoostConfig(numeric_features=("plr2",))
-        for malformed in ("iop", b"iop", [" "], [" iop"], [["iop"]]):
-            with self.assertRaises(ValueError):
-                GlaBoostConfig(numeric_features=malformed)
+            self.model().predict_score(self.visits)
 
 
 if __name__ == "__main__":

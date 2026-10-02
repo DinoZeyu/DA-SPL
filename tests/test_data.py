@@ -1,17 +1,14 @@
 """Small synthetic fixtures only; these tests never load the research cohort."""
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
 import openpyxl
 
 from glaboost.data import (
     VisitInput,
     load_grape,
-    load_jsonl,
 )
 
 
@@ -21,10 +18,6 @@ class DataAdapterTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
 
-    def manifest(self, rows):
-        path = self.directory / "visits.jsonl"
-        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
-        return path
 
     def grape(self, baseline=None, followup=None):
         if baseline is None:
@@ -143,52 +136,6 @@ class DataAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no follow-up records"):
             load_grape(self.grape(followup=[[1, "OD", 1, 0, 15, "/", 18]]))
 
-    def test_jsonl_keeps_metadata_labels_and_modalities_separate(self):
-        path = self.manifest([{
-            "sample_id": "visit-1", "image_path": "images/a.png",
-            "structured": {"cup_to_disc_ratio": 0.5}, "text": "rim observation",
-            "human": {"risk": 0.2}, "patient_id": "patient-a", "eye_id": "patient-a-OS",
-            "time_years": 1.5, "target": 1,
-        }])
-        before = path.read_bytes()
-        visits, targets = load_jsonl(path, require_labels=True)
-        visit = visits[0]
-        np.testing.assert_array_equal(targets, [1])
-        self.assertEqual(visit.image, (self.directory / "images/a.png").resolve())
-        self.assertEqual(visit.structured, {"cup_to_disc_ratio": 0.5})
-        self.assertEqual(visit.human, {"risk": 0.2})
-        self.assertEqual((visit.patient_id, visit.eye_id, visit.time_years), ("patient-a", "patient-a-OS", 1.5))
-        self.assertFalse(hasattr(visit, "target"))
-        self.assertEqual(path.read_bytes(), before)
-
-    def test_jsonl_never_derives_labels_from_risk(self):
-        visits, labels = load_jsonl(self.manifest([{"sample_id": "a", "human": {"risk": "high risk"}}]))
-        self.assertIsNone(labels)
-        self.assertIsNone(visits[0].image)
-        self.assertEqual(visits[0].structured, {})
-        self.assertIsNone(visits[0].text)
-
-    def test_jsonl_requires_complete_targets(self):
-        cases = [
-            ([{"sample_id": "a"}], True),
-            ([{"sample_id": "a", "target": 0}, {"sample_id": "b"}], False),
-            ([{"sample_id": "a", "target": None}], False),
-            ([{"sample_id": "a", "target": True}], False),
-            ([{"sample_id": "a", "target": 2}], False),
-        ]
-        for rows, required in cases:
-            with self.subTest(rows=rows):
-                with self.assertRaises(ValueError):
-                    load_jsonl(self.manifest(rows), require_labels=required)
-
-    def test_jsonl_rejects_duplicate_ids_and_unknown_fields(self):
-        for rows, message in [
-            ([{"sample_id": "a"}, {"sample_id": "a"}], "duplicate sample_id"),
-            ([{"sample_id": "a", "label": 1}], "unsupported manifest fields"),
-        ]:
-            with self.subTest(rows=rows):
-                with self.assertRaisesRegex(ValueError, message):
-                    load_jsonl(self.manifest(rows))
 
     def test_visit_mapping_defaults_are_independent(self):
         first, second = VisitInput("a"), VisitInput("b")

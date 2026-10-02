@@ -1,6 +1,5 @@
 """Read-only input adapters; reference labels and visit metadata stay separate."""
 
-import json
 import math
 import os
 from dataclasses import dataclass, field
@@ -8,21 +7,6 @@ from numbers import Integral, Real
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-import numpy as np
-
-
-FUNDUS_NUMERIC_FEATURES = ("cup_to_disc_ratio",)
-FUNDUS_CATEGORICAL_FEATURES = (
-    "optic_disc_size",
-    "isnt_rule_followed",
-    "rim_pallor",
-    "rim_color",
-    "bayoneting",
-    "sharp_edge",
-    "laminar_dot_sign",
-    "notching",
-    "rim_thinning",
-)
 
 PathInput = Union[str, os.PathLike]
 
@@ -32,8 +16,8 @@ class VisitInput:
     """One visit's inputs; grouping/time metadata are not model features.
 
     ``image`` may hold original bytes, a path, or an already decoded image.
-    ``human`` is a separate, explicitly enabled modality with independently
-    documented provenance. Targets deliberately have no field in this object.
+    Other fields carry audit metadata and never enter the image classifier.
+    Targets deliberately have no field in this object.
     """
 
     sample_id: str
@@ -51,8 +35,8 @@ class GrapeDataset:
     """All GRAPE visits and separate eye-level progression reference labels.
 
     The labels are progression outcomes, never glaucoma/normal diagnoses.
-    Visits contain only raw CFP paths and contemporaneous IOP as predictors;
-    VF measurements and baseline-only measurements are deliberately excluded.
+    The classifier uses only raw CFPs. Contemporaneous IOP is retained for
+    availability accounting; VF measurements remain separate reference outcomes.
     """
 
     visits: List[VisitInput]
@@ -93,23 +77,6 @@ def _sample_id(value: object, seen: set, context: str) -> str:
         raise ValueError(f"{context}: duplicate sample_id {value!r}")
     seen.add(value)
     return value
-
-
-def _optional_string(value: object, field_name: str, context: str) -> Optional[str]:
-    if value is not None and not isinstance(value, str):
-        raise ValueError(f"{context}: {field_name} must be a string or null")
-    return value
-
-
-def _resolve_image_path(value: object, directory: Path, context: str) -> Optional[Path]:
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{context}: image path must be a nonempty string or null")
-    image_path = Path(value)
-    if not image_path.is_absolute():
-        image_path = directory / image_path
-    return image_path.resolve()
 
 
 def _grape_rows(sheet, required: Sequence[str]) -> List[Dict[str, object]]:
@@ -242,73 +209,3 @@ def load_grape(root: PathInput = "data/raw/grape") -> GrapeDataset:
         if any(right[1] <= left[1] for left, right in zip(entries, entries[1:])):
             raise ValueError(f"{eye_id}: Interval Years must increase with Visit Number")
     return GrapeDataset(visits=sorted(visits, key=_visit_sort_key), progression_labels=outcomes)
-
-
-def load_jsonl(
-    path: PathInput, *, require_labels: bool = False
-) -> Tuple[List[VisitInput], Optional[np.ndarray]]:
-    """Load an explicit visit manifest with optional, separate binary targets.
-
-    Permitted fields are ``sample_id``, ``image_path``, ``structured``, ``text``,
-    ``human``, ``patient_id``, ``eye_id``, ``time_years`` and ``target``. Binary
-    targets use 1 for the explicitly chosen positive endpoint and 0 otherwise;
-    this reader does not assign a diagnostic or progression meaning to them.
-    If any row supplies a target, every row must supply one. No target is ever
-    inferred from the human/risk channel.
-    Missing modalities are left missing for the model's configured validation.
-    """
-    path = Path(path).resolve()
-    allowed = {
-        "sample_id", "image_path", "structured", "text", "human",
-        "patient_id", "eye_id", "time_years", "target",
-    }
-    visits: List[VisitInput] = []
-    labels: List[int] = []
-    seen: set = set()
-    target_present: List[bool] = []
-    with path.open("r", encoding="utf-8") as stream:
-        for line_number, line in enumerate(stream, start=1):
-            if not line.strip():
-                continue
-            context = f"{path.name}, line {line_number}"
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{context}: invalid JSON") from exc
-            if not isinstance(row, dict):
-                raise ValueError(f"{context}: expected a JSON object")
-            unexpected = set(row) - allowed
-            if unexpected:
-                raise ValueError(f"{context}: unsupported manifest fields {sorted(unexpected)}")
-            sample_id = _sample_id(row.get("sample_id"), seen, context)
-            for field_name in ("structured", "human"):
-                if not isinstance(row.get(field_name, {}), dict):
-                    raise ValueError(f"{context}: {field_name} must be a JSON object")
-            time_years = row.get("time_years")
-            if time_years is not None:
-                if isinstance(time_years, bool) or not isinstance(time_years, Real) or not math.isfinite(time_years):
-                    raise ValueError(f"{context}: time_years must be a finite number or null")
-                time_years = float(time_years)
-            has_target = "target" in row
-            if require_labels and not has_target:
-                raise ValueError(f"{context}: target is required")
-            if has_target:
-                labels.append(_binary_label(row["target"], context))
-            target_present.append(has_target)
-            visits.append(
-                VisitInput(
-                    sample_id=sample_id,
-                    image=_resolve_image_path(row.get("image_path"), path.parent, context),
-                    structured=dict(row.get("structured", {})),
-                    text=_optional_string(row.get("text"), "text", context),
-                    human=dict(row.get("human", {})),
-                    patient_id=_optional_string(row.get("patient_id"), "patient_id", context),
-                    eye_id=_optional_string(row.get("eye_id"), "eye_id", context),
-                    time_years=time_years,
-                )
-            )
-    if not visits:
-        raise ValueError(f"{path.name}: no visit records")
-    if any(target_present) and not all(target_present):
-        raise ValueError(f"{path.name}: targets must be provided for every record or none")
-    return visits, np.asarray(labels, dtype=np.int64) if labels else None

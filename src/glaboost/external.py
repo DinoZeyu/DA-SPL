@@ -153,7 +153,7 @@ def _preflight_model(entry, cache_dir, image_weights, allow_download):
 def _snapshot_code(directory):
     manifest = {}
     files = list((PROJECT_ROOT / "src" / "glaboost").glob("*.py"))
-    files += [PROJECT_ROOT / name for name in ("run_grape.sh", "pyproject.toml", "uv.lock", "Glaboost_CH.py")]
+    files += [PROJECT_ROOT / name for name in ("run_grape.sh", "pyproject.toml", "uv.lock")]
     files += list((PROJECT_ROOT / "configs").glob("*.json"))
     for source in files:
         if not source.is_file():

@@ -54,5 +54,5 @@ mappings are trained and patient-cross-validated on GRAPE; this does not establi
 external validation of the complete progression pipeline. Old GRAPE-trained progression
 runs are retired and must not be presented as evidence for the new workflow.
 
-To evaluate already trained compatible models instead, populate
-`configs/external_models.json` and use `bash run_grape.sh --plan configs/external_models.json`.
+To reuse the saved diagnostic models without retraining, run
+`bash run_grape.sh --plan result/hf_training/external_models.json --run-name grape_recheck`.

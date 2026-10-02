@@ -5,14 +5,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
 import torch
 from PIL import Image
 
-from glaboost.encoders import MBERTEncoder, ResNet152Encoder, normalize_rim_text, resolve_image_devices
+from glaboost.encoders import ResNet152Encoder, image_encoder_class, resolve_image_devices
 
 
 class TinyResNet(torch.nn.Module):
@@ -27,32 +26,6 @@ class TinyResNet(torch.nn.Module):
         self.batches.append(pixels.detach().cpu().clone())
         self.grad_modes.append(torch.is_grad_enabled())
         return pixels.mean(dim=(1, 2, 3)).unsqueeze(1).repeat(1, 2048) * self.marker
-
-
-class TinyBert(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.marker = torch.nn.Parameter(torch.ones(1))
-        self.config = SimpleNamespace(hidden_size=768, model_type="bert", _commit_hash="a" * 40)
-        self.grad_modes = []
-
-    def forward(self, input_ids, attention_mask):
-        self.grad_modes.append(torch.is_grad_enabled())
-        return SimpleNamespace(last_hidden_state=input_ids.float().unsqueeze(-1).repeat(1, 1, 768) * self.marker)
-
-
-class TinyTokenizer:
-    def __init__(self):
-        self.calls = []
-
-    def __call__(self, texts, **kwargs):
-        self.calls.append((list(texts), kwargs))
-        # Special-token values are distinct from both text and deliberately large padding.
-        rows = [[10] + [len(word) for word in text.split()][:kwargs["max_length"] - 2] + [20]
-                for text in texts]
-        width = max(map(len, rows))
-        return {"input_ids": torch.tensor([row + [999] * (width - len(row)) for row in rows]),
-                "attention_mask": torch.tensor([[1] * len(row) + [0] * (width - len(row)) for row in rows])}
 
 
 class TinyDataParallel(torch.nn.Module):
@@ -80,16 +53,16 @@ def cpu_only_tensor_to(tensor, *args, **kwargs):
 
 class EncoderTests(unittest.TestCase):
     def test_lazy_construction_empty_input_and_json_spec(self):
-        with patch("glaboost.encoders._resnet152_uninitialized") as image_loader, \
-             patch("glaboost.encoders._transformer_classes") as text_loader:
-            image, text = ResNet152Encoder(), MBERTEncoder()
+        with patch("glaboost.encoders._resnet152_uninitialized") as image_loader:
+            image = ResNet152Encoder()
             self.assertEqual(image.transform([]).shape, (0, 2048))
-            self.assertEqual(text.transform([]).shape, (0, 768))
             self.assertIsNone(image.spec()["fingerprint"])
-            self.assertIsNone(text.spec()["fingerprint"])
-            json.dumps([image.spec(), text.spec()])
+            json.dumps(image.spec())
+            self.assertIs(image_encoder_class("resnet152"), ResNet152Encoder)
+            for name in ("resnet18", "resnet50", None):
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    image_encoder_class(name)
             image_loader.assert_not_called()
-            text_loader.assert_not_called()
 
     def test_device_resolution_respects_torch_visible_count_and_explicit_selection(self):
         for requested, count, expected in (
@@ -118,12 +91,12 @@ class EncoderTests(unittest.TestCase):
 
     def test_lazy_specs_do_not_probe_gpus_or_load_networks(self):
         with patch("glaboost.encoders.resolve_image_devices") as resolve:
-            for encoder in (ResNet152Encoder(device="auto"), MBERTEncoder(device="auto")):
-                self.assertEqual(encoder.spec()["requested_device"], "auto")
-                self.assertIsNone(encoder.spec()["resolved_device"])
-                self.assertEqual(encoder.spec()["active_gpu_ids"], [])
-                self.assertEqual(encoder.spec()["parallelism"], "unresolved")
-                encoder.transform([])
+            encoder = ResNet152Encoder(device="auto")
+            self.assertEqual(encoder.spec()["requested_device"], "auto")
+            self.assertIsNone(encoder.spec()["resolved_device"])
+            self.assertEqual(encoder.spec()["active_gpu_ids"], [])
+            self.assertEqual(encoder.spec()["parallelism"], "unresolved")
+            encoder.transform([])
             resolve.assert_not_called()
 
     def test_multigpu_image_scatter_preserves_order_global_batch_and_fingerprint(self):
@@ -198,25 +171,6 @@ class EncoderTests(unittest.TestCase):
             self.assertTrue(loader.call_args.kwargs["progress"])
             self.assertTrue(loader.call_args.kwargs["check_hash"])
 
-    def test_optional_mbert_auto_uses_only_first_visible_gpu(self):
-        network, tokenizer = TinyBert(), TinyTokenizer()
-        model_class, tokenizer_class = Mock(), Mock()
-        model_class.from_pretrained.return_value = network, {}
-        tokenizer_class.from_pretrained.return_value = tokenizer
-        with patch("glaboost.encoders._transformer_classes", return_value=(model_class, tokenizer_class)), \
-             patch("torch.cuda.is_available", return_value=True), \
-             patch("torch.cuda.device_count", return_value=3), \
-             patch.object(network, "to", return_value=network) as model_to, \
-             patch.object(torch.Tensor, "to", new=cpu_only_tensor_to), \
-             patch("torch.nn.DataParallel") as parallel:
-            encoder = MBERTEncoder(device="auto")
-            result = encoder.transform(["rim"])
-        model_to.assert_called_once_with("cuda:0")
-        parallel.assert_not_called()
-        np.testing.assert_allclose(result[0], 11)
-        self.assertEqual(encoder.spec()["active_gpu_ids"], [0])
-        self.assertEqual(encoder.spec()["active_gpu_count"], 1)
-
     def test_missing_resnet_weights_never_fall_back_to_random_or_download(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch("glaboost.encoders._resnet152_uninitialized") as builder, \
@@ -227,6 +181,19 @@ class EncoderTests(unittest.TestCase):
             builder.assert_not_called()
             download.assert_not_called()
             self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_corrupted_official_cache_is_rejected_before_model_construction(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("glaboost.encoders._resnet152_uninitialized") as builder, \
+             patch("torch.hub.load_state_dict_from_url") as download:
+            encoder = ResNet152Encoder(cache_dir=directory)
+            checkpoint = Path(directory) / "torch" / encoder.checkpoint_filename
+            checkpoint.parent.mkdir()
+            torch.save(TinyResNet().state_dict(), checkpoint)
+            with self.assertRaisesRegex(ValueError, "invalid official SHA256"):
+                encoder.transform([Image.new("RGB", (2, 2))])
+            builder.assert_not_called()
+            download.assert_not_called()
 
     def test_resnet_preprocessing_order_freezing_and_local_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -264,94 +231,12 @@ class EncoderTests(unittest.TestCase):
                     encoder.transform([Image.new("RGB", (2, 2))])
             self.assertFalse(encoder.spec()["loaded"])
 
-    def test_text_normalization_and_missing_values(self):
-        self.assertEqual(normalize_rim_text("  ＡＢＣ\t‘Thin’\nRIM—Inferior… "), "abc 'thin' rim-inferior...")
-        for value in (None, "", " \t\n", float("nan")):
-            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "row 1"):
-                MBERTEncoder().transform(["valid", value])
-
-    def test_mbert_masked_pooling_batch_invariance_order_and_freezing(self):
-        network, tokenizer = TinyBert(), TinyTokenizer()
-        model_class = Mock()
-        model_class.from_pretrained.return_value = (network, {"missing_keys": [], "unexpected_keys": ["cls.predictions.bias"]})
-        tokenizer_class = Mock()
-        tokenizer_class.from_pretrained.return_value = tokenizer
-        with tempfile.TemporaryDirectory() as directory, \
-             patch("glaboost.encoders._transformer_classes", return_value=(model_class, tokenizer_class)):
-            encoder = MBERTEncoder(cache_dir=directory, batch_size=2)
-            result = encoder.transform(["RIM", "very thin rim"])
-            alone = encoder.transform(["RIM"])
-        self.assertEqual(result.dtype, np.float32)
-        self.assertEqual(result.shape, (2, 768))
-        np.testing.assert_allclose(result[0], (10 + 3 + 20) / 3)
-        np.testing.assert_allclose(result[1], (10 + 4 + 4 + 3 + 20) / 5)
-        np.testing.assert_array_equal(result[:1], alone)
-        self.assertFalse(network.training)
-        self.assertTrue(all(not p.requires_grad for p in network.parameters()))
-        self.assertEqual(network.grad_modes, [False, False])
-        self.assertEqual(tokenizer.calls[0][0], ["rim", "very thin rim"])
-        self.assertEqual(tokenizer.calls[0][1]["max_length"], 128)
-        self.assertTrue(model_class.from_pretrained.call_args.kwargs["local_files_only"])
-        self.assertFalse(model_class.from_pretrained.call_args.kwargs["trust_remote_code"])
-        self.assertFalse(model_class.from_pretrained.call_args.kwargs["add_pooling_layer"])
-        self.assertEqual(tokenizer_class.from_pretrained.call_args.kwargs["revision"], "a" * 40)
-        self.assertEqual(encoder.spec()["fingerprint"], "hf_commit:" + "a" * 40)
-        self.assertEqual(encoder.spec()["resolved_revision"], "a" * 40)
-        json.dumps(encoder.spec())
-
-    def test_mbert_missing_weights_and_incomplete_loading_are_errors(self):
-        model_class, tokenizer_class = Mock(), Mock()
-        model_class.from_pretrained.side_effect = OSError("offline cache miss")
-        with patch("glaboost.encoders._transformer_classes", return_value=(model_class, tokenizer_class)):
-            with self.assertRaisesRegex(FileNotFoundError, "allow_download=False"):
-                MBERTEncoder().transform(["rim"])
-            tokenizer_class.from_pretrained.assert_not_called()
-            model_class.from_pretrained.side_effect = None
-            model_class.from_pretrained.return_value = (TinyBert(), {"missing_keys": ["embeddings.word_embeddings.weight"]})
-            with self.assertRaisesRegex(ValueError, "refusing random"):
-                MBERTEncoder().transform(["rim"])
-
-    def test_mbert_local_fingerprint_survives_relocation_and_tracks_tokenizer(self):
-        model_class, tokenizer_class = Mock(), Mock()
-        model_class.from_pretrained.side_effect = lambda *args, **kwargs: (TinyBert(), {})
-        tokenizer_class.from_pretrained.return_value = TinyTokenizer()
-        with tempfile.TemporaryDirectory() as directory, \
-             patch("glaboost.encoders._transformer_classes", return_value=(model_class, tokenizer_class)):
-            first, second = Path(directory) / "first", Path(directory) / "second"
-            for folder in (first, second):
-                folder.mkdir()
-                (folder / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
-                (folder / "tokenizer.json").write_text("fixture tokenizer", encoding="utf-8")
-                (folder / "model.safetensors").write_bytes(b"fixture model")
-            encoders = [MBERTEncoder(model_name=str(folder)) for folder in (first, second)]
-            for encoder in encoders:
-                encoder.transform(["rim"])
-                self.assertIsNone(encoder.spec()["resolved_revision"])
-            self.assertEqual(encoders[0].spec()["fingerprint"], encoders[1].spec()["fingerprint"])
-            (second / "tokenizer.json").write_text("changed tokenizer", encoding="utf-8")
-            changed = MBERTEncoder(model_name=str(second))
-            changed.transform(["rim"])
-            self.assertNotEqual(encoders[0].spec()["fingerprint"], changed.spec()["fingerprint"])
-
-    def test_mbert_unknown_remote_commit_is_rejected(self):
-        network = TinyBert()
-        network.config._commit_hash = None
-        model_class, tokenizer_class = Mock(), Mock()
-        model_class.from_pretrained.return_value = network, {}
-        tokenizer_class.from_pretrained.return_value = TinyTokenizer()
-        with patch("glaboost.encoders._transformer_classes", return_value=(model_class, tokenizer_class)):
-            with self.assertRaisesRegex(ValueError, "no resolved commit"):
-                MBERTEncoder(revision="main").transform(["rim"])
-
     def test_invalid_parameters_and_scalar_inputs(self):
-        for cls in (ResNet152Encoder, MBERTEncoder):
-            for batch_size in (0, -1, True, 1.2):
-                with self.subTest(cls=cls, batch_size=batch_size), self.assertRaises(ValueError):
-                    cls(batch_size=batch_size)
-            with self.assertRaises(TypeError):
-                cls().transform("single sample")
-        with self.assertRaises(ValueError):
-            MBERTEncoder(max_length=513)
+        for batch_size in (0, -1, True, 1.2):
+            with self.subTest(batch_size=batch_size), self.assertRaises(ValueError):
+                ResNet152Encoder(batch_size=batch_size)
+        with self.assertRaises(TypeError):
+            ResNet152Encoder().transform("single sample")
 
 
 if __name__ == "__main__":
