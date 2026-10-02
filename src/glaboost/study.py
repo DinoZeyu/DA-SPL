@@ -80,12 +80,14 @@ def _check_model_mapping(metadata):
 
 def write_visit_scores(output, visits, scores, *, model_directory, grape_root,
                        min_visits=3, training_data_description="",
-                       training_data_reference="", grape_overlap="unknown"):
+                       training_data_reference="", grape_overlap="unknown",
+                       independence_evidence="Operator declaration; not independently verified"):
     """Save scores and a checksum-linked provenance sidecar, without overwrite.
 
-    Training independence is an operator declaration, not inferred from a high
-    accuracy, an architecture name, or a checkpoint hash. Unknown provenance is
-    retained explicitly and cannot support an external-validation claim.
+    Training independence must be documented, not inferred from a high accuracy,
+    an architecture name, or a checkpoint hash. Supplied evidence is retained as
+    provenance, not independently verified here; it does not override the overlap
+    declaration. Unknown provenance cannot support an external-validation claim.
     """
     if grape_overlap not in ("none", "unknown", "present"):
         raise ValueError("grape_overlap must be none, unknown, or present.")
@@ -93,6 +95,8 @@ def write_visit_scores(output, visits, scores, *, model_directory, grape_root,
         raise ValueError("A detector trained/selected using GRAPE cannot enter this fixed-detector study.")
     if grape_overlap == "none" and not training_data_description.strip():
         raise ValueError("Document the diagnostic training data when declaring no GRAPE overlap.")
+    if not isinstance(independence_evidence, str) or not independence_evidence.strip():
+        raise ValueError("independence_evidence must be a nonempty provenance description.")
     if isinstance(min_visits, bool) or not isinstance(min_visits, int) or min_visits < 3:
         raise ValueError("The longitudinal study requires at least three CFP visits per eye.")
     output = ensure_outside_raw(output, grape_root)
@@ -132,7 +136,7 @@ def write_visit_scores(output, visits, scores, *, model_directory, grape_root,
             "description": training_data_description.strip() or "Not documented",
             "reference": training_data_reference.strip() or None,
             "grape_overlap": grape_overlap,
-            "independence_evidence": "Operator declaration; not independently verified",
+            "independence_evidence": independence_evidence,
             "scope": "Detector training, preprocessing, feature selection and model selection",
         },
     }
@@ -399,11 +403,9 @@ def _refresh_project_readme(result_dir, run_name, evaluation, cohort, provenance
             lines.append(f"| {names[endpoint]} | {label} | " + " | ".join(estimates) + " |")
     lines += ["", f"![Latest versus longitudinal balanced accuracy and paired differences, with 95% patient-bootstrap CIs](result/{run_name}/figures/primary_comparison.png)"]
     design = provenance.get("validation_design")
-    if design == "internal_nested_patient_cv":
-        lines += ["", "This is **retrospective internal validation on GRAPE**: ResNet-152 features and XGBoost are "
-                  "adapted to three separate progression endpoints. Inner patient-held-out scores train A/B mappings; "
-                  "outer held-out patients supply the final estimates. This is not external validation of a pretrained diagnosis model."]
-    elif design == "external_fixed_detector":
+    from .reporting import _visit_model_description
+    lines += ["", _visit_model_description(evaluation, provenance)]
+    if design == "external_fixed_detector":
         lines += ["", "The fixed visit detector is declared independent of GRAPE in the supplied provenance. "
                   "The progression mappings are nevertheless fitted and patient-cross-validated within GRAPE; "
                   "the complete progression pipeline has not undergone an independent external validation."]
@@ -420,15 +422,19 @@ def _refresh_project_readme(result_dir, run_name, evaluation, cohort, provenance
 
 
 def create_study_report(scores_path, *, run_name, grape_root="data/raw/grape",
-                        result_dir="result", config=None):
+                        result_dir="result", config=None, synthetic=False):
     """Run the prespecified A/B evaluation and create one immutable report folder.
 
     This is an explicit experiment entry point for the user to execute. The
-    implementation is tested using small synthetic fixtures only.
+    implementation is tested using small synthetic fixtures only. Set synthetic
+    for those fixtures so every report and its metadata identify the software
+    check and the project's results summary is left unchanged.
     """
     from .longitudinal import EvaluationConfig, evaluate_longitudinal, prepare_eye_records
     from .reporting import write_report
 
+    if not isinstance(synthetic, bool):
+        raise ValueError("synthetic must be a boolean.")
     if not isinstance(run_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", run_name):
         raise ValueError("run_name must be 1-80 letters/digits/dots/underscores/hyphens, starting alphanumeric.")
     result_dir = ensure_outside_raw(result_dir, grape_root)
@@ -442,11 +448,15 @@ def create_study_report(scores_path, *, run_name, grape_root="data/raw/grape",
     eyes = prepare_eye_records(rows, dataset.progression_labels, min_visits=metadata["min_visits"])
     cohort = describe_cohort(dataset, eyes, metadata["model_info"])
     evaluation = evaluate_longitudinal(eyes, config or EvaluationConfig())
+    evaluation["synthetic"] = synthetic
     design = ("external_fixed_detector" if metadata["detector_training_data"]["grape_overlap"] == "none"
               else "retrospective_fixed_detector_unverified_external")
+    model_origin = metadata["model_info"].get("implementation")
+    if not isinstance(model_origin, str) or not model_origin.strip():
+        model_origin = "Unknown; not documented in model metadata"
     provenance = {
         "run_name": run_name, "created_at": datetime.now(timezone.utc).isoformat(),
-        "validation_design": design, "model_origin": "paper_reimplementation",
+        "validation_design": design, "model_origin": model_origin, "synthetic": synthetic,
         "model_info": metadata["model_info"],
         "model_metadata_sha256": metadata.get("model_metadata_sha256"),
         "detector_training_data": metadata["detector_training_data"],
@@ -460,10 +470,11 @@ def create_study_report(scores_path, *, run_name, grape_root="data/raw/grape",
     }
     run_dir.mkdir(parents=True, exist_ok=False)
     status = {"status": "incomplete", "run_name": run_name,
-              "created_at": provenance["created_at"], "validation_design": design}
+              "created_at": provenance["created_at"], "validation_design": design,
+              "synthetic": synthetic}
     _json_write(run_dir / "status.json", status)
     try:
-        write_report(run_dir, evaluation, cohort, provenance, eyes)
+        write_report(run_dir, evaluation, cohort, provenance, eyes, synthetic=synthetic)
         _json_write(run_dir / "cohort.json", cohort)
         # Preserve exact bytes: the archived CSV and sidecar retain the checksums
         # already recorded in provenance, including original numeric formatting.
@@ -487,5 +498,6 @@ def create_study_report(scores_path, *, run_name, grape_root="data/raw/grape",
     status["status"] = "complete"
     (run_dir / "status.json").write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
     _refresh_result_index(result_dir)
-    _refresh_project_readme(result_dir, run_name, evaluation, cohort, provenance)
+    if not synthetic:
+        _refresh_project_readme(result_dir, run_name, evaluation, cohort, provenance)
     return run_dir

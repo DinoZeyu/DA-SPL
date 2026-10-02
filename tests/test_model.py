@@ -107,6 +107,8 @@ class GlaBoostTests(unittest.TestCase):
             output = Path(root) / "model"
             model.save(output)
             restored = GlaBoost.load(output)
+            self.assertEqual(restored.classifier_.get_params()["predictor"], "cpu_predictor")
+            self.assertEqual(restored.classifier_.get_params()["gpu_id"], -1)
             np.testing.assert_allclose(model.predict_proba(self.visits), restored.predict_proba(self.visits))
             self.assertEqual(model.feature_names_, restored.feature_names_)
             self.assertEqual(set(model.feature_importance()), set(model.feature_names_))
@@ -118,6 +120,86 @@ class GlaBoostTests(unittest.TestCase):
                 stream.write(" ")
             with self.assertRaisesRegex(ValueError, "checksum"):
                 GlaBoost.load(output)
+
+    def test_loaded_classifier_uses_runtime_device_without_changing_learned_settings(self):
+        original = GlaBoost(self.config).fit(self.visits, self.y)
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "model"
+            original.save(output)
+            metadata_path = output / "metadata.json"
+            base_metadata = json.loads(metadata_path.read_text())
+            cases = ((self.config, "cuda:1", "cuda:1", (1,), "gpu_predictor", 1),
+                     (replace(self.config, device="cuda:1", tree_method="gpu_hist", gpu_id=1),
+                      "cpu", "cpu", (), "cpu_predictor", -1))
+            for training_config, device, resolved, gpu_ids, predictor, gpu_id in cases:
+                with self.subTest(device=device):
+                    # Only mock runtime placement; these are not GPU-trained checkpoints.
+                    metadata = dict(base_metadata, config=training_config.to_dict())
+                    metadata_path.write_text(json.dumps(metadata))
+                    before = metadata_path.read_bytes()
+                    state = {"learner": {"generic_param": {"gpu_id": str(gpu_id)}, "gradient_booster": {
+                        "gbtree_train_param": {"tree_method": training_config.tree_method, "predictor": predictor}}}}
+                    classifier = Mock()
+                    classifier.n_features_in_ = len(original.feature_names_)
+                    classifier.get_booster.return_value.save_config.side_effect = lambda: json.dumps(state)
+                    classifier.predict_proba.return_value = np.tile([.25, .75], (len(self.visits), 1))
+                    with patch("glaboost.model.XGBClassifier", return_value=classifier), \
+                            patch("glaboost.model.resolve_image_devices", return_value=(resolved, gpu_ids)):
+                        restored = GlaBoost.load(output, device=device)
+                    classifier.set_params.assert_called_once_with(
+                        n_jobs=training_config.n_jobs, predictor=predictor, gpu_id=gpu_id)
+                    self.assertEqual(restored.training_config_, training_config)
+                    self.assertEqual(restored.config.n_estimators, 3)
+                    self.assertEqual(restored.config.max_depth, 2)
+                    self.assertEqual(restored.prediction_runtime_["resolved_device"], resolved)
+                    np.testing.assert_array_equal(restored.predict_score(self.visits), np.full(len(self.visits), .75))
+                    self.assertEqual(metadata_path.read_bytes(), before)
+                    classifier.fit.assert_not_called()
+                    # Reject backend changes before exposing predictions.
+                    classifier.predict_proba.reset_mock()
+                    state["learner"]["generic_param"]["gpu_id"] = "0" if gpu_id != 0 else "1"
+                    with self.assertRaisesRegex(RuntimeError, "prediction device/backend"):
+                        restored.predict_score(self.visits)
+                    classifier.predict_proba.assert_not_called()
+
+    def test_gpu_load_rejects_cpu_fallback_and_unavailable_device(self):
+        original = GlaBoost(self.config).fit(self.visits, self.y)
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "model"
+            original.save(output)
+            classifier = Mock()
+            classifier.n_features_in_ = len(original.feature_names_)
+            classifier.get_booster.return_value.save_config.return_value = json.dumps({
+                "learner": {"generic_param": {"gpu_id": "-1"}, "gradient_booster": {
+                    "gbtree_train_param": {"tree_method": "hist", "predictor": "cpu_predictor"}}}})
+            with patch("glaboost.model.XGBClassifier", return_value=classifier), \
+                    patch("glaboost.model.resolve_image_devices", return_value=("cuda:0", (0, 1))):
+                with self.assertRaisesRegex(RuntimeError, "CPU fallback"):
+                    GlaBoost.load(output, device="cuda")
+            with patch("glaboost.model.resolve_image_devices", side_effect=RuntimeError("CUDA unavailable")), \
+                    patch("glaboost.model.XGBClassifier") as constructor:
+                with self.assertRaisesRegex(RuntimeError, "CUDA unavailable"):
+                    GlaBoost.load(output, device="cuda")
+                constructor.assert_not_called()
+
+    def test_runtime_batch_and_cache_overrides_preserve_resaved_training_provenance(self):
+        original = GlaBoost(self.config).fit(self.visits, self.y)
+        with tempfile.TemporaryDirectory() as root:
+            output, resaved = Path(root) / "model", Path(root) / "resaved"
+            original.save(output)
+            metadata = json.loads((output / "metadata.json").read_text())
+            restored = GlaBoost.load(output, device="cpu", image_batch_size=128, cache_dir=str(Path(root) / "cache"))
+            self.assertEqual(restored.config.image_batch_size, 128)
+            self.assertEqual(restored.training_config_, self.config)
+            restored.save(resaved)
+            saved = json.loads((resaved / "metadata.json").read_text())
+            self.assertEqual(saved["config"], metadata["config"])
+            self.assertEqual(saved["target"], {"0": "normal", "1": "glaucoma"})
+            self.assertEqual(len(restored.classifier_.get_booster().get_dump()), 3)
+            np.testing.assert_array_equal(original.predict_score(self.visits), restored.predict_score(self.visits))
+            for invalid in (0, -1, True, 1.5):
+                with self.subTest(batch=invalid), self.assertRaisesRegex(ValueError, "image_batch_size"):
+                    GlaBoost.load(output, image_batch_size=invalid)
 
     def test_fusion_order_and_encoder_identity_round_trip(self):
         c = replace(self.config, use_image=True, use_text=True,

@@ -1,0 +1,22 @@
+{
+  "format_version": 1,
+  "source": {
+    "repo_id": "AswanthCManoj/glaucoma_diagnosis_json_analysis",
+    "revision": "0de47a09a14f558b50da0f579b00f76e1e420c50"
+  },
+  "primary_model": "paper100_depth6",
+  "models": [
+    {"name": "paper100_depth6", "n_estimators": 100, "max_depth": 6},
+    {"name": "paper100_depth3", "n_estimators": 100, "max_depth": 3},
+    {"name": "paper500_depth3", "n_estimators": 500, "max_depth": 3},
+    {"name": "paper500_depth6", "n_estimators": 500, "max_depth": 6}
+  ],
+  "min_visits": 3,
+  "evaluation": {
+    "n_splits": 3,
+    "seed": 42,
+    "bootstrap_replicates": 2000,
+    "persistence_threshold": 0.5,
+    "logistic_c": 1.0
+  }
+}

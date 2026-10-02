@@ -5,4 +5,5 @@ Synthetic smoke tests are not stored here.
 
 | Run | Created (UTC) | Status | Report |
 |---|---|---|---|
-| primary_seed42_fixed | 2026-09-28T02:37:17.614026+00:00 | internal_nested_patient_cv | [HTML](primary_seed42_fixed/report.html) / [Markdown](primary_seed42_fixed/report.md) |
+| grape_validation | 2026-10-02T23:20:16.198545+00:00 | external_fixed_detector_comparison | [HTML](grape_validation/report.html) / [Markdown](grape_validation/report.md) |
+| hf_training | 2026-10-02T23:19:47.882853+00:00 | independent_source_diagnosis_training | [HTML](hf_training/report.html) / [Markdown](hf_training/report.md) |

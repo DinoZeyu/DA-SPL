@@ -82,8 +82,17 @@ class StudyTests(unittest.TestCase):
         rows, metadata = load_verified_scores(self.scores_path, self.dataset, self.root)
         self.assertEqual(len(rows), len(self.visits))
         self.assertEqual(metadata["detector_training_data"]["grape_overlap"], "unknown")
+        self.assertEqual(metadata["detector_training_data"]["independence_evidence"],
+                         "Operator declaration; not independently verified")
         self.assertEqual(len(metadata["source"]["image_sha256"]), len(self.visits))
         self.assertIn("model_metadata_sha256", metadata)
+
+    def test_supplied_independence_evidence_is_retained_without_upgrading_overlap(self):
+        evidence = "SYNTHETIC training manifest: fixture-source.json; overlap audit pending."
+        self.write_scores(independence_evidence=evidence)
+        _, metadata = load_verified_scores(self.scores_path, self.dataset, self.root)
+        self.assertEqual(metadata["detector_training_data"]["independence_evidence"], evidence)
+        self.assertEqual(metadata["detector_training_data"]["grape_overlap"], "unknown")
 
     def test_no_overlap_requires_description_and_known_overlap_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Document"):
@@ -148,23 +157,27 @@ class StudyTests(unittest.TestCase):
 
     def test_synthetic_end_to_end_separate_report_no_overwrite(self):
         from glaboost.longitudinal import EvaluationConfig
-        from glaboost.reporting import write_report
-        self.write_scores()
+        evidence = "SYNTHETIC independent training source; no real model or study result."
+        self.write_scores(grape_overlap="none", training_data_description="SYNTHETIC external fixture",
+                          independence_evidence=evidence)
         # Valid alternative number formatting must survive archival unchanged.
         def mutate(rows):
             rows[0]["time_years"] = "0.0000000000"
             return rows
         self.update_csv(mutate)
         result = self.directory / "result"
-        def synthetic_writer(*args, **kwargs):
-            return write_report(*args, **kwargs, synthetic=True)
         with patch("glaboost.study.load_grape", return_value=self.dataset), \
-                patch("glaboost.reporting.write_report", side_effect=synthetic_writer):
+                patch("glaboost.study._refresh_project_readme") as refresh_readme:
             run = create_study_report(self.scores_path, run_name="synthetic-test", grape_root=self.root,
-                                      result_dir=result, config=EvaluationConfig(bootstrap_replicates=20))
+                                      result_dir=result, config=EvaluationConfig(bootstrap_replicates=20),
+                                      synthetic=True)
+        refresh_readme.assert_not_called()
         self.assertTrue((run / "report.html").is_file())
         self.assertIn("SYNTHETIC", (run / "report.md").read_text())
-        self.assertEqual(json.loads((run / "status.json").read_text())["status"], "complete")
+        status = json.loads((run / "status.json").read_text())
+        self.assertEqual(status["status"], "complete")
+        self.assertIs(status["synthetic"], True)
+        self.assertIs(json.loads((run / "evaluation.json").read_text())["synthetic"], True)
         self.assertIn("synthetic-test/report.html", (result / "INDEX.md").read_text())
         self.assertTrue((run / "exclusions.csv").is_file())
         self.assertTrue((run / "cohort.json").is_file())
@@ -172,10 +185,30 @@ class StudyTests(unittest.TestCase):
         self.assertEqual((run / "visit_scores.metadata.json").read_bytes(),
                          score_metadata_path(self.scores_path).read_bytes())
         provenance = json.loads((run / "provenance.json").read_text())
+        self.assertIs(provenance["synthetic"], True)
+        self.assertEqual(provenance["model_origin"], self.model_metadata["implementation"])
+        self.assertEqual(provenance["detector_training_data"]["independence_evidence"], evidence)
+        self.assertEqual(provenance["validation_design"], "external_fixed_detector")
+        self.assertIn("internally cross-validated progression mappings", (run / "report.md").read_text())
         self.assertEqual(sha256_file(run / "visit_scores.metadata.json"), provenance["score_metadata_sha256"])
         with self.assertRaises(FileExistsError):
             create_study_report(self.scores_path, run_name="synthetic-test", grape_root=self.root,
-                                result_dir=result, config=EvaluationConfig(bootstrap_replicates=20))
+                                result_dir=result, config=EvaluationConfig(bootstrap_replicates=20),
+                                synthetic=True)
+
+    def test_missing_model_origin_is_explicitly_unknown(self):
+        self.model_metadata.pop("implementation")
+        (self.model / "metadata.json").write_text(json.dumps(self.model_metadata))
+        self.write_scores()
+        with patch("glaboost.study.load_grape", return_value=self.dataset), \
+                patch("glaboost.longitudinal.evaluate_longitudinal", return_value={}), \
+                patch("glaboost.reporting.write_report") as writer:
+            create_study_report(self.scores_path, run_name="unknown-origin", grape_root=self.root,
+                                result_dir=self.directory / "result", synthetic=True)
+        provenance = writer.call_args.args[3]
+        self.assertEqual(provenance["model_origin"], "Unknown; not documented in model metadata")
+        self.assertEqual(provenance["validation_design"], "retrospective_fixed_detector_unverified_external")
+        self.assertIs(writer.call_args.kwargs["synthetic"], True)
 
     def test_failed_render_is_marked_failed_and_never_indexed_as_complete(self):
         from glaboost.longitudinal import EvaluationConfig
@@ -185,8 +218,11 @@ class StudyTests(unittest.TestCase):
                 patch("glaboost.reporting.write_report", side_effect=RuntimeError("synthetic render failure")):
             with self.assertRaisesRegex(RuntimeError, "synthetic render failure"):
                 create_study_report(self.scores_path, run_name="failed-test", grape_root=self.root,
-                                    result_dir=result, config=EvaluationConfig(bootstrap_replicates=20))
-        self.assertEqual(json.loads((result / "failed-test/status.json").read_text())["status"], "failed")
+                                    result_dir=result, config=EvaluationConfig(bootstrap_replicates=20),
+                                    synthetic=True)
+        status = json.loads((result / "failed-test/status.json").read_text())
+        self.assertEqual(status["status"], "failed")
+        self.assertIs(status["synthetic"], True)
         self.assertFalse((result / "INDEX.md").exists())
 
     def test_report_index_symlink_is_rejected_before_evaluation(self):
@@ -252,7 +288,7 @@ class StudyTests(unittest.TestCase):
                                   for endpoint in evaluation["endpoints"]}}
         with patch("glaboost.study.PROJECT_ROOT", self.directory):
             _refresh_project_readme(self.directory / "result", "latest-run", evaluation, cohort,
-                                    {"validation_design": "internal_nested_patient_cv"})
+                                    {"validation_design": "external_fixed_detector"})
         actual = readme.read_text()
         self.assertIn("Median visits per eye: 3.0 (IQR 3.0–4.0); median CFP follow-up: 25.6 months (IQR 19.9–38.4).", actual)
         self.assertIn("percentages", actual)
@@ -265,7 +301,7 @@ class StudyTests(unittest.TestCase):
         self.assertIn("AUPRC uses average precision", actual)
         self.assertIn("result/latest-run/supplementary_metrics.csv", actual)
         self.assertIn("result/latest-run/figures/primary_comparison.png", actual)
-        self.assertIn("retrospective internal validation on GRAPE", actual)
+        self.assertIn("complete progression pipeline has not undergone an independent external validation", actual)
         self.assertIn("conditional on fixed out-of-fold predictions", actual)
         self.assertNotRegex(actual, r"[\u4e00-\u9fff]")
 
@@ -291,6 +327,7 @@ class StudyTests(unittest.TestCase):
         self.assertIn("complete progression pipeline has not undergone an independent external validation", actual)
         self.assertNotIn("retrospective internal validation on GRAPE", actual)
         self.assertNotRegex(actual, r"\bnan\b")
+
 
 
 if __name__ == "__main__":

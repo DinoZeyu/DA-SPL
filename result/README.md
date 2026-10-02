@@ -1,35 +1,58 @@
-# 给教授展示的研究报告
+# GRAPE fixed-detector analysis reports
 
-当前没有正式实验报告。合成测试在临时目录运行，不放入这里，也不作为研究结果展示。
+These are cohort-level reports for Dr. Zhang's longitudinal A/B study. The diagnostic
+detector is fixed independently of GRAPE; progression mappings are trained and
+patient-cross-validated within GRAPE.
 
-主流程使用论文的冻结 ResNet-152 + XGBoost 架构，在 GRAPE 上分别训练三个进展模型，
-进行嵌套患者级内部验证，不称为原诊断模型的外部验证。
+The completed analysis uses two short report-directory names:
 
-每次 `train-grape --run-name <名称>` 创建一个独立目录，不覆盖已有运行。
-根目录的 `bash run_grape.sh` 可一次完成特征提取、模型训练、纵向评估与报告生成；可用
-`--run-name <名称>` 指定报告目录，未指定则自动生成名称。
-完成后 [INDEX.md](INDEX.md) 列出全部完成的报告；根目录 README 展示最近完成的运行，
-不自动挑选效果最好的运行。失败的目录保留 `status.json` 和原因，不列为完成报告。
+- [hf_training](hf_training/report.html): source diagnosis training and test results.
+- [grape_validation](grape_validation/report.html): longitudinal A/B comparisons on GRAPE.
 
-本目录及报告、图表、CSV、JSON 真实保存在 home：
-`/users/zeyuhan/charlie_codebase/DA-SPL/result/<名称>/`。
-模型和冻结图像特征另存 `/scratch/users/zeyuhan/DA-SPL/artifacts/<名称>/`，
-原始数据和缓存也继续保存在 scratch。运行命令不变，模型与报告使用同一运行名对应。
+The saved provenance retains the original run identifiers and execution paths;
+the corresponding model artifacts keep those identifiers on scratch.
 
-每次运行的主要文件：
+Run `bash run_grape.sh` inside the already allocated GPU node to train the source
+diagnosis models and then evaluate their fixed outputs on GRAPE. Source training uses
+the retained HF training split; retained test rows supply separate diagnosis
+metrics that are never used to select a model. Existing outputs are never overwritten.
 
-- `report.html`：可直接打开、单文件分享的英文报告，图像已嵌入；可由浏览器打印为 PDF。
-- `report.md`：报告文本，便于修改、复制教授的队列级总结。
-- `figures/`：三种结局的 A/B 比较、配对差值及描述性分数轨迹，含 PNG/PDF/SVG。
-- `primary_results.csv`、`supplementary_metrics.csv`：结果表。
-- `predictions.csv`、`temporal_features.csv`：逐眼外层折外预测与时间特征。
-- `visit_predictions.csv`：按结局及内外层划分保存的进展相关就诊分数。
-- `evaluation.json`：完整指标、置信区间、患者划分、训练折标准化与逻辑回归系数。
-- `cohort.json`、`exclusions.csv`：队列统计、时间窗口及排除原因。
-- `provenance.json`：模型、数据、编码器和环境来源；旧固定诊断模型模式另保存 `visit_scores.csv` 和旁车 JSON。
-- `status.json`：运行是否完整完成。
+The source release has 589 training and 100 test records before exclusions. Identical
+decoded images within a split keep their first occurrence; train/test matches retain
+the training image and exclude matching test rows. Conflicting labels or any exact
+HF/GRAPE image overlap stop the run. Source reports show actual retained counts and
+exclusions, rather than treating all 100 released test rows as independent observations.
 
-生成的运行目录默认不提交 Git，但会保留在本机。分享完整分析包时复制整个运行目录；
-训练模型及冻结特征另存 `artifacts/<同一运行名>/`，完整复核时一起保留。
-仅展示报告时可单独分享 HTML。请保留不同运行的研究目的，不能用反复试参数后最好的
-结果替代预先规定的主分析。
+The workflow is ready to run. [INDEX.md](INDEX.md) and the root README's automatic
+results block show which analyses have completed.
+The primary model is `paper100_depth6` (100 trees, depth 6); the other predeclared
+tree/depth configurations are supplementary. These are source-trained reconstructions,
+not the authors' model weights or a claim to their reported accuracy.
+
+| File or directory | Purpose |
+|---|---|
+| `<run>_source/` | Source-training configuration, held-out diagnosis metrics and overlap/provenance summary |
+| `<run>/report.html`, `report.md` | All configurations, with the primary model specified in advance |
+| `<run>/<model-name>/report.html` | Standalone cohort report with embedded figures |
+| Configuration CSV/JSON files | Metrics, scores, OOF predictions, cohort, exclusions, provenance and folds |
+| Configuration `figures/` | Three-endpoint paired comparison and descriptive score histories |
+| Batch plan/status/audit files | Exact inputs, intended configurations, completion and comparability |
+| Batch `code/` | Source and environment snapshot for reproduction |
+
+Completed batches appear in [INDEX.md](INDEX.md). The root README shows the predeclared
+primary analysis from the latest complete batch, not the best observed configuration.
+Failed batches preserve their status and completed children. Synthetic tests stay in
+temporary directories and are not research results.
+
+Reports remain in home. Source model parameters/features are saved at
+`artifacts/<run>_source/` and GRAPE scores/progression mappings at `artifacts/<run>/`;
+the `artifacts` link points into `/scratch/users/zeyuhan/DA-SPL/`.
+
+The source split lacks patient IDs, and exact-image duplicate checks cannot establish
+patient independence. The fixed detector is trained outside GRAPE, but the progression
+mappings are trained and patient-cross-validated on GRAPE; this does not establish
+external validation of the complete progression pipeline. Old GRAPE-trained progression
+runs are retired and must not be presented as evidence for the new workflow.
+
+To evaluate already trained compatible models instead, populate
+`configs/external_models.json` and use `bash run_grape.sh --plan configs/external_models.json`.

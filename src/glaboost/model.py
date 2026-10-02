@@ -19,7 +19,7 @@ from xgboost import XGBClassifier
 
 from .config import GlaBoostConfig
 from .data import VisitInput
-from .encoders import MBERTEncoder, ResNet152Encoder
+from .encoders import MBERTEncoder, image_encoder_class, resolve_image_devices
 from .structured import StructuredEncoder
 
 
@@ -40,7 +40,7 @@ def _package_version(name):
 
 
 def make_xgb_classifier(config):
-    """Shared paper classifier settings for diagnosis and progression adaptation.
+    """Shared configured classifier for diagnosis and progression adaptation.
 
     The caller defines and records the target. The architecture alone does not
     turn a progression classifier into the paper's glaucoma diagnosis model.
@@ -52,7 +52,8 @@ def make_xgb_classifier(config):
         learning_rate=config.learning_rate, max_depth=config.max_depth,
         n_estimators=config.n_estimators, random_state=config.random_state,
         n_jobs=config.n_jobs, tree_method=config.tree_method,
-        subsample=1.0, colsample_bytree=1.0, reg_alpha=0.0, reg_lambda=1.0,
+        subsample=config.subsample, colsample_bytree=config.colsample_bytree,
+        reg_alpha=0.0, reg_lambda=1.0,
         **execution,
     )
 
@@ -71,6 +72,17 @@ def assert_xgb_backend(model, config):
                            "refusing a silent CPU fallback.")
 
 
+def _assert_prediction_backend(classifier, runtime):
+    """Check prediction placement independently of the original training method."""
+    state = json.loads(classifier.get_booster().save_config())["learner"]
+    generic = state.get("generic_param", {})
+    tree = state.get("gradient_booster", {}).get("gbtree_train_param", {})
+    if (int(generic.get("gpu_id", -2)) != runtime["gpu_id"]
+            or tree.get("predictor") != runtime["predictor"]):
+        raise RuntimeError("XGBoost did not retain the requested prediction device/backend; "
+                           "refusing a silent device change or CPU fallback.")
+
+
 class GlaBoost:
     """A reusable diagnosis classifier; probability column 1 means glaucoma.
 
@@ -86,7 +98,7 @@ class GlaBoost:
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
         if c.use_image and self.image_encoder is None:
-            self.image_encoder = ResNet152Encoder(
+            self.image_encoder = image_encoder_class(c.image_encoder)(
                 weights_path=c.image_weights_path, cache_dir=c.cache_dir,
                 device=c.device, batch_size=c.image_batch_size,
                 allow_download=allow_download,
@@ -212,6 +224,9 @@ class GlaBoost:
             "all_patient_ids_available": all(v.patient_id is not None for v in visits),
             "n_features": features.shape[1],
         }
+        self.training_config_ = self.config
+        # A deliberate new fit replaces any previous load-time device binding.
+        self.__dict__.pop("prediction_runtime_", None)
         self._fitted = True
         return self
 
@@ -227,7 +242,13 @@ class GlaBoost:
     def predict_proba(self, visits):
         """Return [P(normal), P(glaucoma)] for each independent visit."""
         features = self.transform(visits)
-        return self.classifier_.predict_proba(features)
+        runtime = getattr(self, "prediction_runtime_", None)
+        if runtime is not None:
+            _assert_prediction_backend(self.classifier_, runtime)
+        probabilities = self.classifier_.predict_proba(features)
+        if runtime is not None:
+            _assert_prediction_backend(self.classifier_, runtime)
+        return probabilities
 
     def predict_score(self, visits):
         """Continuous visit-level evidence S_it; not a progression probability."""
@@ -250,7 +271,9 @@ class GlaBoost:
         directory.mkdir(parents=True, exist_ok=False)
         model_path = directory / "model.json"
         self.classifier_.save_model(model_path)
-        config = self.config.to_dict()
+        # Relocating inference to another GPU/CPU must not rewrite the recorded
+        # training configuration or imply that the learned trees were refitted.
+        config = self.training_config_.to_dict()
         resolved_revision = self._encoder_specs.get("text", {}).get("resolved_revision")
         if resolved_revision:
             config["text_revision"] = resolved_revision
@@ -274,9 +297,13 @@ class GlaBoost:
 
     @classmethod
     def load(cls, directory, *, device=None, cache_dir=None,
-             image_weights_path=None, text_model_name=None, allow_download=False,
+             image_weights_path=None, image_batch_size=None, text_model_name=None, allow_download=False,
              image_encoder=None, text_encoder=None):
-        """Load fixed preprocessing and classifier; encoder fingerprints must match."""
+        """Load fixed parameters, binding both encoder and classifier inference.
+
+        ``training_config_`` retains the saved fit configuration. Device and
+        path overrides are runtime settings; learned tree parameters do not change.
+        """
         directory = Path(directory)
         metadata = json.loads((directory / "metadata.json").read_text())
         if metadata.get("format_version") != 1 or metadata.get("target") != {"0": "normal", "1": "glaucoma"}:
@@ -286,10 +313,18 @@ class GlaBoost:
         config = GlaBoostConfig.from_dict(metadata["config"])
         overrides = {key: value for key, value in {
             "device": device, "cache_dir": cache_dir,
-            "image_weights_path": image_weights_path, "text_model_name": text_model_name,
+            "image_weights_path": image_weights_path, "image_batch_size": image_batch_size,
+            "text_model_name": text_model_name,
         }.items() if value is not None}
         model = cls(replace(config, **overrides), allow_download=allow_download,
                     image_encoder=image_encoder, text_encoder=text_encoder)
+        resolved, gpu_ids = resolve_image_devices(model.config.device)
+        model.prediction_runtime_ = {
+            "requested_device": model.config.device, "resolved_device": resolved,
+            "predictor": "gpu_predictor" if gpu_ids else "cpu_predictor",
+            "gpu_id": gpu_ids[0] if gpu_ids else -1,
+        }
+        model.training_config_ = config
         if metadata["structured_state"] is not None:
             model._structured = StructuredEncoder.from_dict(metadata["structured_state"])
         if metadata["human_state"] is not None:
@@ -299,7 +334,10 @@ class GlaBoost:
         model.training_summary_ = metadata["training_summary"]
         model.classifier_ = XGBClassifier()
         model.classifier_.load_model(directory / "model.json")
-        model.classifier_.set_params(n_jobs=model.config.n_jobs)
+        model.classifier_.set_params(
+            n_jobs=model.config.n_jobs, predictor=model.prediction_runtime_["predictor"],
+            gpu_id=model.prediction_runtime_["gpu_id"])
+        _assert_prediction_backend(model.classifier_, model.prediction_runtime_)
         if model.classifier_.n_features_in_ != len(model.feature_names_):
             raise ValueError("Saved feature schema does not match the classifier.")
         model._fitted = True

@@ -67,14 +67,65 @@ def _distribution(value):
     )
 
 
+def _visit_model_description(evaluation, provenance):
+    """Describe the fixed detector's saved settings without inventing provenance."""
+    info = provenance.get("model_info", {}) or {}
+    config = info.get("config", {}) or {}
+    spec = info.get("encoder_spec", {}) or (info.get("encoder_specs") or {}).get("image", {}) or {}
+    encoder = config.get("image_encoder", spec.get("encoder", "not recorded"))
+    encoder_name = {"resnet18": "ResNet18", "resnet152": "ResNet152"}.get(encoder, str(encoder))
+    dimension = spec.get("output_dim", "not recorded")
+    dimension = format(dimension, ",") if isinstance(dimension, int) else str(dimension)
+    keys = ("n_estimators", "max_depth", "learning_rate", "subsample", "colsample_bytree", "reg_lambda", "reg_alpha")
+    settings = {key: config.get(key, "not recorded") for key in keys}
+    # These two constants are part of this identified implementation, rather
+    # than defaults inferred for an arbitrary imported detector.
+    if info.get("implementation") == "GlaBoost paper-based reconstruction; not author weights":
+        settings["reg_lambda"] = config.get("reg_lambda", 1.)
+        settings["reg_alpha"] = config.get("reg_alpha", 0.)
+    source = spec.get("source", {}) or {}
+    official = {"resnet152": ("ResNet152_Weights.IMAGENET1K_V1", "394f9c45"),
+                "resnet18": ("ResNet18_Weights.IMAGENET1K_V1", "f37072fd")}.get(encoder)
+    imagenet = bool(official and source.get("kind") == "torchvision"
+                    and source.get("weights") == official[0]
+                    and str(source.get("sha256", "")).startswith(official[1]))
+    qualifier = "frozen " if spec.get("frozen") is True else "fixed "
+    if imagenet:
+        qualifier += "ImageNet "
+    text = (
+        "The visit model uses a {}{} encoder with {} output features and an XGBoost binary "
+        "logistic classifier: {} trees, maximum depth {}, learning rate {}, row subsampling {}, column "
+        "subsampling {}, L2 {}, and L1 {}."
+    ).format(qualifier, encoder_name, dimension, settings["n_estimators"], settings["max_depth"],
+             settings["learning_rate"], settings["subsample"], settings["colsample_bytree"],
+             settings["reg_lambda"], settings["reg_alpha"])
+    preprocessing = spec.get("preprocessing", {}) or {}
+    if preprocessing:
+        mean, std = preprocessing.get("mean"), preprocessing.get("std")
+        normalization = ("normalization not recorded" if "mean" not in preprocessing or "std" not in preprocessing else
+                         "no mean/std normalization" if mean is None and std is None else
+                         "ImageNet mean/std normalization" if mean == [.485, .456, .406] and std == [.229, .224, .225] else
+                         "normalization with mean {} and std {}".format(mean, std))
+        text += " Image preprocessing: color {}; resize {}; interpolation {}; scale {}; {}.".format(
+            preprocessing.get("color", "not recorded"), preprocessing.get("resize", "not recorded"),
+            preprocessing.get("interpolation", "not recorded"), preprocessing.get("scale", "not recorded"), normalization)
+    else:
+        text += " Image preprocessing is not recorded in the supplied metadata."
+    if not imagenet:
+        text += " Encoder training origin is not established by the checkpoint hash alone; see the supplied provenance."
+    return text
+
+
+def _external_design(provenance):
+    design = provenance.get("validation_design")
+    if design not in ("external_fixed_detector", "retrospective_fixed_detector_unverified_external"):
+        raise ValueError("Reports require fixed-detector validation provenance.")
+    return design == "external_fixed_detector"
+
+
 def _summary(evaluation, cohort, provenance, synthetic):
-    internal = provenance.get("validation_design") == "internal_nested_patient_cv"
-    external = provenance.get("validation_design") == "external_fixed_detector"
+    external = _external_design(provenance)
     opening = (
-        "We conducted a retrospective internal validation of a paper-based GlaBoost architecture adapted "
-        "to progression assessment in the GRAPE longitudinal glaucoma cohort. The image-based visit "
-        "models and temporal mappings were evaluated together using nested patient-grouped cross-validation. "
-        if internal else
         "We conducted a retrospective external evaluation of a fixed visit-level detector on the GRAPE cohort, "
         "with internally cross-validated progression mappings. External independence is based on the supplied "
         "detector provenance declaration. "
@@ -83,6 +134,7 @@ def _summary(evaluation, cohort, provenance, synthetic):
         "External validation is not established because independence of the visit-level detector from GRAPE "
         "has not been documented. "
     )
+    opening += _visit_model_description(evaluation, provenance) + " "
     if synthetic:
         opening = "SYNTHETIC TEST DATA — SOFTWARE CHECK ONLY. These numbers are not study findings. " + opening
     source = cohort.get("source", {})
@@ -96,12 +148,6 @@ def _summary(evaluation, cohort, provenance, synthetic):
         _number(cohort.get("followup_months", {}).get("median"), 1),
     )
     text += (
-        "A separate visit model was trained for each endpoint and outer fold, using only training patients. "
-        "Within each fold, the same trained model was applied independently to each held-out visit for both "
-        "comparators; its outputs were integrated using prespecified temporal changes and trends. "
-        "Training visit labels were inherited from each eye's retrospective progression outcome; the resulting "
-        "scores are endpoint-specific evidence, not labels of disease state at an individual visit. "
-        if internal else
         "The fixed detector was applied independently at each eligible visit; its outputs were integrated "
         "using prespecified temporal changes and trends. "
     )
@@ -260,26 +306,17 @@ def _primary_figure(evaluation, synthetic=False):
         return fig
 
 
-def _selected_eyes(eye_records, internal=False):
+def _selected_eyes(eye_records):
     ordered = sorted(eye_records, key=lambda row: (str(row.get("patient_id", "")), str(row.get("eye_id", ""))))
-    if internal:
-        return [row for endpoint in ENDPOINTS for row in
-                [record for record in ordered if record.get("endpoint") == endpoint][:2]]
     return ordered[:6]
 
 
-def _trajectory_figure(eye_records, synthetic=False, internal=False):
+def _trajectory_figure(eye_records, synthetic=False):
     import matplotlib.pyplot as plt
     from matplotlib.ticker import MaxNLocator
 
-    selected = _selected_eyes(eye_records, internal=internal)
-    slots = {}
-    if internal:
-        for column, endpoint in enumerate(ENDPOINTS):
-            for row, record in enumerate(record for record in selected if record["endpoint"] == endpoint):
-                slots[row * 3 + column] = record
-    else:
-        slots = dict(enumerate(selected))
+    selected = _selected_eyes(eye_records)
+    slots = dict(enumerate(selected))
     with plt.rc_context(_style()):
         fig, axes = plt.subplots(2, 3, figsize=(7.2, 5.5), sharex=True, sharey=True)
         fig.subplots_adjust(left=.11, right=.98, bottom=.28, top=.82, wspace=.18, hspace=.55)
@@ -296,10 +333,6 @@ def _trajectory_figure(eye_records, synthetic=False, internal=False):
             if pairs:
                 ax.plot([v[0] for v in pairs], [v[1] for v in pairs], color=BLUE, marker="o", markersize=3.5, linewidth=1, clip_on=False)
             title = "{}  {}".format(chr(97 + index), record.get("eye_id", "eye"))
-            if internal:
-                title = "{}  {} / {}\nOuter fold {}".format(
-                    chr(97 + index), ENDPOINT_NAMES[record["endpoint"]], record.get("eye_id", "eye"),
-                    record.get("outer_fold", record.get("fold", "not recorded")))
             ax.set_title(title, loc="left", fontsize=9)
             ax.set_ylim(0, 1)
             ax.set_xlim(0, max(1, max_time) * 1.03)
@@ -308,29 +341,24 @@ def _trajectory_figure(eye_records, synthetic=False, internal=False):
             ax.grid(color="#E5E5E5", linewidth=.6)
             if index // 3 == 1:
                 ax.set_xlabel("Time from baseline (years)", fontsize=8)
-            if index % 3 == 0 and not internal:
+            if index % 3 == 0:
                 ax.set_ylabel("Visit-level diagnosis score")
-        if internal:
-            fig.text(.025, .55, "Visit-level progression evidence", rotation="vertical", va="center", fontsize=9)
         if not selected:
             fig.text(.5, .5, "No eligible score trajectories", ha="center", va="center")
         fig.suptitle("SYNTHETIC TEST DATA — NOT STUDY RESULTS" if synthetic else "Illustrative visit-level score histories", y=.98, fontsize=11)
-        fig.text(.02, .15, "First two held-out eyes per endpoint, sorted by patient and eye ID; no outcome-based selection."
-                 if internal else "First six eligible eyes sorted by patient and eye ID; selection does not use outcomes or performance.", fontsize=8)
-        if internal:
-            fig.text(.02, .105, "Models differ by endpoint and outer fold; each sequence uses one model fixed across its visits.", fontsize=8)
+        fig.text(.02, .15, "First six eligible eyes sorted by patient and eye ID; selection does not use outcomes or performance.", fontsize=8)
         fig.text(.02, .060, "Points are observed visit scores; lines guide the eye. Score changes alone do not establish progression.", fontsize=8)
         return fig
 
 
-def _save_figures(run_dir, evaluation, eye_records, synthetic, internal=False):
+def _save_figures(run_dir, evaluation, eye_records, synthetic):
     import matplotlib.pyplot as plt
 
     figures = run_dir / "figures"
     figures.mkdir(exist_ok=True)
     for name, builder, values in (("primary_comparison", _primary_figure, evaluation),
                                    ("score_trajectories", _trajectory_figure, eye_records)):
-        fig = builder(values, synthetic=synthetic, **({"internal": internal} if name == "score_trajectories" else {}))
+        fig = builder(values, synthetic=synthetic)
         try:
             # Font embedding is consulted at export time, after builders return.
             with plt.rc_context(_style()):
@@ -359,10 +387,8 @@ def _compact_provenance(value):
 
 
 def _report_blocks(evaluation, cohort, provenance, eye_records, synthetic):
-    internal = provenance.get("validation_design") == "internal_nested_patient_cv"
-    external = provenance.get("validation_design") == "external_fixed_detector"
+    external = _external_design(provenance)
     title = (
-        "Retrospective internal validation of longitudinal glaucoma progression assessment on GRAPE" if internal else
         "Preliminary external evaluation of longitudinal glaucoma progression assessment" if external else
         "Preliminary retrospective assessment of longitudinal glaucoma progression")
     if synthetic:
@@ -371,7 +397,7 @@ def _report_blocks(evaluation, cohort, provenance, eye_records, synthetic):
     if synthetic:
         blocks.append(("p", "SYNTHETIC TEST DATA. This document checks the software and must not be presented as research findings."))
     blocks.append(("p", "Run: {}. Created: {}.".format(provenance.get("run_name", "not recorded"), provenance.get("created_at", "not recorded"))))
-    if not external and not internal:
+    if not external:
         blocks.append(("p", "PROVISIONAL: external validation is not established. The detector's independence from GRAPE requires documented training and model-selection provenance."))
     blocks.extend([("h2", "Cohort-level summary"), ("p", _summary(evaluation, cohort, provenance, synthetic))])
     blocks.append(("h2", "Eligible cohort"))
@@ -395,17 +421,14 @@ def _report_blocks(evaluation, cohort, provenance, eye_records, synthetic):
         ["Original CFP / Corresponding CFP", "{} of {} source visits; {} of {} included visits".format(
             _count(source.get("n_visits_with_cfp")), _count(source.get("n_visits")),
             _count(cfp.get("available_visits", cohort.get("n_visits"))), _count(cohort.get("n_visits"))),
-         "Visit-model input; original photographs only, no annotation overlays" if internal else
          "Fixed detector input; original photographs only, no annotation overlays"],
         ["Contemporaneous IOP", "{} available; {} missing in included visits".format(
             _count(iop.get("available_visits")), _count(iop.get("missing_visits"))),
-         "Not used in the image-only progression model" if internal else
          "Enabled in fixed detector" if iop.get("selected") else "Not enabled in fixed detector"],
         ["Clinical text / human risk assessment", "Unavailable as longitudinal GRAPE inputs", "Not used; not synthesized"],
         ["Baseline OCT / RNFL", "Baseline-only measurements", "Not copied across subsequent visits; not used"],
         ["Visual field / PLR2, PLR3, MD-slope labels", "Released progression reference labels",
-         "Eye-level supervision for training patients and reference outcomes for held-out patients; never input features"
-         if internal else "Outcomes only; excluded from predictors"],
+         "Outcomes only; excluded from predictors"],
         ["Subject Number / Laterality / Interval Years", "Patient, eye, actual elapsed years", "Grouping and timing metadata; not visit-detector predictors"],
     ]))
     window = cohort.get("observation_window", {})
@@ -441,76 +464,34 @@ def _report_blocks(evaluation, cohort, provenance, eye_records, synthetic):
     blocks.append(_table(["Endpoint", "Metric", "A: latest visit", "B: longitudinal"], supplemental))
     blocks.append(("h2", "Descriptive interpretation of the score histories"))
     blocks.append(("image", "figures/score_trajectories.png",
-                   "Up to two held-out histories per endpoint, selected by sorted patient and eye ID without outcome "
-                   "or performance selection. Models differ by endpoint and outer fold; each sequence uses one "
-                   "model fixed across its visits. The plots show model evidence, not anatomical explanations."
-                   if internal else
                    "Illustrative histories selected by sorted patient and eye ID, without outcome or performance selection. "
                    "No diagnostic interpretation of fundus anatomy is inferred from these plots."))
-    selected = _selected_eyes(eye_records, internal=internal)
+    selected = _selected_eyes(eye_records)
     trajectory_rows = []
     for eye in selected:
         scores, times = eye.get("scores", []), eye.get("times", [])
-        prefix = ([ENDPOINT_NAMES[eye["endpoint"]], str(eye.get("outer_fold", eye.get("fold", "not recorded")))]
-                  if internal else [])
-        trajectory_rows.append(prefix + [str(eye.get("eye_id", "")), str(len(scores)),
+        trajectory_rows.append([str(eye.get("eye_id", "")), str(len(scores)),
                                 _number(max(times) - min(times), 2) if times else "not recorded",
                                 _number(max(scores) - min(scores)) if scores else "not recorded"])
-    blocks.append(_table((["Endpoint", "Outer fold"] if internal else []) +
-                         ["Illustrative eye", "Visits", "Observed span (years)", "Score range (maximum − minimum)"], trajectory_rows))
+    blocks.append(_table(["Illustrative eye", "Visits", "Observed span (years)", "Score range (maximum − minimum)"], trajectory_rows))
     blocks.append(("p",
-                   "A nearly flat trajectory indicates little change in the learned visit evidence; a changing "
-                   "trajectory can reflect image differences or acquisition variability. The eye-level training "
-                   "outcome does not establish when progression began or whether it was present at an individual "
-                   "visit. Scores are neither disease-severity measurements nor prospectively calibrated risks. "
-                   "Differences across endpoints or outer folds also reflect different fitted models. These examples "
-                   "illustrate inputs to temporal aggregation and do not replace cohort-level reference-label evaluation."
-                   if internal else
                    "A nearly flat trajectory indicates little change in the detector's score, which may reflect stable appearance or limited sensitivity to progression. A changing trajectory can also reflect image acquisition variability. Neither pattern establishes clinical stability or deterioration. Diagnosis scores are not validated severity measurements or future progression risks. These examples illustrate inputs to the temporal summary, and do not replace cohort-level reference-label evaluation."))
     blocks.append(("h2", "Prespecified analysis and reproducibility"))
     config = evaluation.get("config", {})
     gpu_statistics = config.get("logistic_solver") == "torch_newton"
-    tree_method = config.get("base_model_config", {}).get("tree_method", "hist")
-    tree_description = ("GPU histogram tree building (gpu_hist), GPU prediction and the recorded seed"
-                        if tree_method == "gpu_hist" else
-                        "CPU histogram tree building and the recorded seed")
+    model_config = (provenance.get("model_info", {}) or {}).get("config", {}) or {}
+    blocks.append(("p", _visit_model_description(evaluation, provenance)))
+    blocks.append(("p", "The fixed detector's recorded tree method is {}; its training seed is {}. "
+                   "It is not refitted using GRAPE progression labels. The same detector and visit scores "
+                   "serve both A and B and all three reference outcomes.".format(
+                       model_config.get("tree_method", "not recorded"),
+                       model_config.get("random_state", "not recorded"))))
     blocks.append(("p", "Eligibility requires at least {} visits per eye with an available original CFP and a valid "
                    "visit score, ordered by actual elapsed years. Visits without a CFP are omitted; source cohort "
                    "visit counts are not treated as available image counts.".format(
                        _count(provenance.get("minimum_cfp_visits_per_eye")))))
-    if internal:
-        blocks.append(("p", "Each eye is a longitudinal unit. All visits and both eyes from a patient remain together "
-                       "in both outer and inner folds. Only original CFP images enter the visit model. Visual-field "
-                       "measurements, progression labels, patient IDs, elapsed times, and visit counts are never visit-model "
-                       "input features. Original files are read without modification, and baseline-only measurements "
-                       "are not copied to later visits. Frozen ImageNet image features may be computed once because "
-                       "the encoder is not fitted to GRAPE images or labels."))
-        blocks.append(("p", "For each endpoint, every training visit inherits its eye's released retrospective "
-                       "progression label. This is weak supervision at the eye level; it does not provide a true "
-                       "progression-state label for each visit. Inverse-visit-count sample weights give each training "
-                       "eye equal total weight, with weights normalized to mean one. Each visit is scored independently "
-                       "from its own image. Later held-out visits do not enter an earlier held-out visit's score."))
-        blocks.append(("p", "The visit model uses a frozen ImageNet ResNet152 encoder with 2,048 output features and "
-                       "an XGBoost binary logistic classifier. The paper-based defaults are 100 trees, maximum depth 6, "
-                       "and learning rate 0.05; " + tree_description + " are implementation "
-                       "choices. This image-only adaptation does not synthesize unavailable text or human assessments. "
-                       "The archived model configuration records the exact settings used in this run."))
-        blocks.append(("p", "Within each outer training partition, inner patient-grouped cross-fitting produces "
-                       "visit scores for training eyes from XGBoost models that never saw those patients. A uses the "
-                       "last score with a logistic progression mapping. B uses the last score, last-minus-first score, "
-                       "ordinary least-squares score slope per actual elapsed year, mean score, and the fraction of "
-                       "visits with scores strictly above the prespecified persistence threshold. Scaling and both "
-                       "logistic mappings are fitted only to these inner out-of-fold summaries. A separate XGBoost "
-                       "model is then fitted to all outer training patients and applied to the outer held-out patients; "
-                       "A and B share that model and its visit scores. Both comparators therefore use a visit model "
-                       "trained on all eligible training visits; 'latest visit' refers to A's inputs at assessment time. "
-                       "Outer held-out labels never enter model fitting; labels are used for class-stratified partitioning "
-                       "and final evaluation. "
-                       "No hyperparameters are selected from outer test performance, and no future prediction horizon "
-                       "is claimed."))
-    else:
-        blocks.append(("p", "Each eye is a longitudinal unit. All visits and both eyes from a patient remain in the same held-out fold. The fixed diagnosis detector is applied separately at each visit; later visits do not enter earlier visit scores. Outcome labels and visual-field measurements are excluded from the visit detector and temporal feature inputs. Original CFP files and contemporaneous IOP, when explicitly enabled in the fixed model, are the available GRAPE predictors; no baseline-only measurement is copied to later visits. Raw data are read without modification."))
-        blocks.append(("p", "A uses the last score with a logistic progression mapping. B uses the last score, last-minus-first score, ordinary least-squares score slope per actual elapsed year, mean score, and the fraction of visits with scores strictly above the prespecified persistence threshold. Both use logistic regression with training-fold feature scaling; all preprocessing and fitting occur within training patients. The progression mappings are internally cross-validated on GRAPE even when the fixed diagnosis detector is external. No future prediction horizon is claimed."))
+    blocks.append(("p", "Each eye is a longitudinal unit. All visits and both eyes from a patient remain in the same held-out fold. The fixed diagnosis detector is applied separately at each visit; later visits do not enter earlier visit scores. Outcome labels and visual-field measurements are excluded from the visit detector and temporal feature inputs. Original CFP files and contemporaneous IOP, when explicitly enabled in the fixed model, are the available GRAPE predictors; no baseline-only measurement is copied to later visits. Raw data are read without modification."))
+    blocks.append(("p", "A uses the last score with a logistic progression mapping. B uses the last score, last-minus-first score, ordinary least-squares score slope per actual elapsed year, mean score, and the fraction of visits with scores strictly above the prespecified persistence threshold. Both use logistic regression with training-fold feature scaling; all preprocessing and fitting occur within training patients. The progression mappings are internally cross-validated on GRAPE even when the fixed diagnosis detector is external. No future prediction horizon is claimed."))
     solver_description = (
         "a float64 GPU damped-Newton solver with Armijo line search, at most 2,000 iterations and an absolute "
         "gradient infinity-norm tolerance of 0.0001. Training-only scaling reproduces StandardScaler's population "
@@ -522,15 +503,10 @@ def _report_blocks(evaluation, cohort, provenance, eye_records, synthetic):
     blocks.append(("p", "Both progression mappings use L2-regularized logistic regression with balanced class weights, "
                    + solver_description +
                    "Classification uses an output of at least 0.5. Balanced-class outputs are not clinically calibrated "
-                   "probabilities. " +
-                   ("StratifiedKFold operates on unique patients, stratified by whether any included eye has the "
-                    "endpoint, and then expands patient partitions back to their eyes. Requested outer and inner "
-                    "fold counts are reduced only for class feasibility; an endpoint is not estimable if no valid "
-                    "nested partition is available at the fixed seed. "
-                    if internal else
-                    "StratifiedGroupKFold shuffles patients using the recorded fixed seed; the requested fold count "
-                    "is capped by positive- and negative-patient counts and reduced if necessary until every training "
-                    "and test partition contains both classes. ") +
+                   "probabilities. "
+                   "StratifiedGroupKFold shuffles patients using the recorded fixed seed; the requested fold count "
+                   "is capped by positive- and negative-patient counts and reduced if necessary until every training "
+                   "and test partition contains both classes. "
                    "No seed or fold choice is selected by predictive performance. A and B share the identical "
                    "splits within each endpoint."))
     if gpu_statistics:
@@ -543,12 +519,9 @@ def _report_blocks(evaluation, cohort, provenance, eye_records, synthetic):
                        "Bootstrap uses a seeded device-specific Torch generator, so its draws differ from the "
                        "previous NumPy PCG64 implementation even at the same seed. Metric definitions, paired "
                        "patient clustering and percentile interpolation are unchanged. CPU code handles input/output, "
-                       "patient-split bookkeeping, task orchestration and report rendering. GPU tree building and "
-                       "the new numerical solver are recorded implementation changes; numerical identity with a "
-                       "CPU run is not claimed."))
+                       "patient-split bookkeeping, task orchestration and report rendering. Numerical identity "
+                       "with a CPU run is not claimed."))
     settings = ["n_splits", "seed", "bootstrap_replicates", "persistence_threshold", "logistic_c", "decision_threshold"]
-    if internal:
-        settings.insert(1, "inner_splits")
     if gpu_statistics:
         settings.extend(["logistic_solver", "gpu_device_ids", "endpoint_compute_devices"])
     blocks.append(_table(["Analysis setting", "Value"], [[key, str(config.get(key, "not recorded"))] for key in settings]))
@@ -560,27 +533,17 @@ def _report_blocks(evaluation, cohort, provenance, eye_records, synthetic):
                           _count(result.get("n_positive_patients")), _count(bs.get("valid")), _count(bs.get("requested")),
                           _count(bs.get("skipped_single_class"))])
     blocks.append(_table(["Endpoint", "Status", "Actual folds", "Positive patients", "Valid bootstrap draws", "Requested draws", "Single-class draws skipped"], fold_rows))
-    if internal:
-        blocks.append(("p", "Nested partitions contain fewer independent progression-positive patients than the full "
-                       "cohort. An inner training partition may contain only one positive patient even when both "
-                       "classes are technically present; such fits can be highly unstable. Per-fold patient identities, "
-                       "class counts, and actual inner splits are archived in evaluation.json. A feasible split does "
-                       "not establish adequate statistical precision."))
     blocks.append(("p", "Bootstrap draws resample patients, retain their eyes together, and use paired A/B predictions. Single-class draws cannot estimate all classification metrics and are skipped. The percentile intervals condition on already fitted out-of-fold predictions: the models and folds are not refitted in each draw, so training-pipeline uncertainty is not covered. AUPRC is implemented as average precision. Endpoint-specific folds, training counts, and any available regression coefficients are preserved in evaluation.json. Regression coefficients describe fitted associations, not clinical causation."))
     blocks.append(("h2", "Model provenance and limits"))
-    blocks.append(("p", "The current software is a paper-based GlaBoost reconstruction adapted to available GRAPE modalities. It must not be described as the authors' released implementation, an independently validated clinical tool, or a reproduction of the paper's reported accuracy. " +
-                   ("The original diagnostic task has been changed to three separate progression endpoints. This "
-                    "report evaluates the complete fitted pipeline internally on GRAPE; it is not an external "
-                    "validation of a pretrained GlaBoost diagnosis model. The eye-level labels provide weak supervision "
-                    "over the original follow-up window and do not establish visit-level disease state or progression timing."
-                    if internal else
-                    "GRAPE contains glaucoma eyes only, so its progression labels cannot train or validate a normal-versus-glaucoma diagnosis classifier.")))
+    blocks.append(("p", "The current software applies a fixed GlaBoost-compatible detector using modalities "
+                   "available at individual GRAPE visits. Missing text, structured fundus descriptors, and human "
+                   "assessments are not synthesized. This does not establish reproduction of the complete original "
+                   "multimodal model or its reported accuracy. GRAPE contains glaucoma eyes only, so its progression "
+                   "labels cannot train or validate a normal-versus-glaucoma diagnosis classifier. The temporal "
+                   "progression mappings are fitted and patient-cross-validated on GRAPE; the complete progression "
+                   "pipeline has not undergone independent external validation."))
     blocks.append(("code", json.dumps(_compact_provenance(provenance), indent=2, ensure_ascii=False, allow_nan=False)))
-    blocks.append(("p", ("The pretrained encoder's provenance is recorded separately from the models fitted on GRAPE. "
-                       "Inner cross-fitted training scores and scores from the model fitted on all outer training "
-                       "patients can have different distributions; this transfer is part of the evaluated pipeline. "
-                       if internal else
-                       "Any independence statement above is based on supplied provenance, not an independent audit. ") +
+    blocks.append(("p", "Any independence statement above is based on supplied provenance, not an independent audit. "
                    "Complete-case image eligibility and sparse progression-positive patients can limit generalizability and precision. No benefit is assumed in advance, no p-values are used, and these results do not establish prospective clinical utility. This simple temporal aggregation does not establish persistent, traceable longitudinal clinical reasoning."))
     blocks.append(("h2", "Eligibility exclusions"))
     exclusions = cohort.get("exclusions", [])
@@ -645,8 +608,7 @@ def write_report(run_dir, evaluation, cohort, provenance, eye_records, synthetic
     """Write a complete cohort report into an existing, new run directory.
 
     ``eye_records`` contains dictionaries with eye_id, patient_id, times (years),
-    and scores. For internal nested validation, these are outer held-out records
-    with endpoint and fold (or outer_fold); an eye may occur once per endpoint.
+    and scores from the same fixed detector; every eligible eye occurs once.
     The study caller owns the status.json completion marker and
     additional archived inputs, including exclusions.csv.
     Existing report artifacts are never overwritten.
@@ -663,13 +625,13 @@ def write_report(run_dir, evaluation, cohort, provenance, eye_records, synthetic
     if any((run_dir / name).exists() for name in names):
         raise FileExistsError("Report artifacts already exist; choose a new run directory")
     evaluation, cohort, provenance, eye_records = map(_clean, (evaluation, cohort, provenance, eye_records))
+    _external_design(provenance)
     provenance = dict(provenance, synthetic=bool(synthetic))
     evaluation = dict(evaluation, synthetic=bool(synthetic))
     # Normalize all content before touching disk, so nonfinite values cannot leak
     # into plots, CSVs, or the portable report.
     json.dumps([evaluation, cohort, provenance, eye_records], allow_nan=False)
-    _save_figures(run_dir, evaluation, eye_records, synthetic,
-                  internal=provenance.get("validation_design") == "internal_nested_patient_cv")
+    _save_figures(run_dir, evaluation, eye_records, synthetic)
     blocks = _report_blocks(evaluation, cohort, provenance, eye_records, synthetic)
     primary, supplementary = _primary_rows(evaluation), _supplementary_rows(evaluation)
     predictions, features = evaluation.get("predictions", []), evaluation.get("features", [])

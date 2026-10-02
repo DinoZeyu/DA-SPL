@@ -1,4 +1,4 @@
-"""Frozen feature encoders for the paper-based GlaBoost implementation.
+"""Frozen image/text encoders for the documented GlaBoost method variants.
 
 Networks are loaded on the first nonempty ``transform`` call. Downloads require
 an explicit opt-in; the default cache belongs to this project, not the user home.
@@ -49,6 +49,12 @@ def _resnet152_uninitialized():
     from torchvision.models import resnet152
 
     return resnet152(weights=None)
+
+
+def _resnet18_uninitialized():
+    from torchvision.models import resnet18
+
+    return resnet18(weights=None)
 
 
 def _transformer_classes():
@@ -130,6 +136,17 @@ class ResNet152Encoder:
     """
 
     output_dim = 2048
+    encoder_name = "resnet152"
+    display_name = "ResNet152"
+    checkpoint_filename = "resnet152-394f9c45.pth"
+    checkpoint_sha256_prefix = "394f9c45"
+    weights_url = _RESNET_URL
+    weights_name = "ResNet152_Weights.IMAGENET1K_V1"
+    normalize_image = True
+
+    @staticmethod
+    def _build_model():
+        return _resnet152_uninitialized()
 
     def __init__(self, *, weights_path: Optional[Union[str, Path]] = None,
                  cache_dir: Optional[Union[str, Path]] = None, device: str = "cpu",
@@ -150,25 +167,25 @@ class ResNet152Encoder:
         import torch
 
         self._resolved_device, self._gpu_ids = resolve_image_devices(self.device)
-        checkpoint = self.weights_path or self.cache_dir / "torch" / _RESNET_URL.rsplit("/", 1)[1]
+        checkpoint = self.weights_path or self.cache_dir / "torch" / self.checkpoint_filename
         if not checkpoint.is_file():
             if self.weights_path is not None or not self.allow_download:
                 raise FileNotFoundError(
-                    f"Pretrained ResNet152 weights not found: {checkpoint}. "
+                    f"Pretrained {self.display_name} weights not found: {checkpoint}. "
                     "Supply weights_path or explicitly enable allow_download. "
                     "Random weights are never used."
                 )
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
             state = torch.hub.load_state_dict_from_url(
-                _RESNET_URL, model_dir=str(checkpoint.parent), map_location="cpu",
+                self.weights_url, model_dir=str(checkpoint.parent), map_location="cpu",
                 progress=True, check_hash=True,
             )
         else:
             state = torch.load(str(checkpoint), map_location="cpu", weights_only=True)
         digest = _sha256(checkpoint)
-        if self.weights_path is None and not digest.startswith("394f9c45"):
-            raise ValueError(f"Cached ResNet152 weights have an invalid official SHA256 prefix: {checkpoint}")
-        model = _resnet152_uninitialized()
+        if self.weights_path is None and not digest.startswith(self.checkpoint_sha256_prefix):
+            raise ValueError(f"Cached {self.display_name} weights have an invalid official SHA256 prefix: {checkpoint}")
+        model = self._build_model()
         model.load_state_dict(state, strict=True)
         model.fc = torch.nn.Identity()
         model.requires_grad_(False)
@@ -181,13 +198,13 @@ class ResNet152Encoder:
         self._source = {
             "kind": "local_checkpoint" if self.weights_path is not None else "torchvision",
             "path": str(checkpoint), "sha256": digest,
-            "weights": None if self.weights_path is not None else "ResNet152_Weights.IMAGENET1K_V1",
-            "url": None if self.weights_path is not None else _RESNET_URL,
+            "weights": None if self.weights_path is not None else self.weights_name,
+            "url": None if self.weights_path is not None else self.weights_url,
         }
         self._model = model
 
-    @staticmethod
-    def _prepare(value: Any):
+    @classmethod
+    def _prepare(cls, value: Any):
         import torch
 
         if isinstance(value, Image.Image):
@@ -204,7 +221,8 @@ class ResNet152Encoder:
             raise ValueError("Image must be a path, encoded bytes, or PIL image; missing images are not imputed")
         image = image.resize((224, 224), resample=Image.Resampling.BILINEAR)
         array = np.array(image, dtype=np.float32, copy=True) / np.float32(255.0)
-        array = (array - np.asarray(_IMAGENET_MEAN, dtype=np.float32)) / np.asarray(_IMAGENET_STD, dtype=np.float32)
+        if cls.normalize_image:
+            array = (array - np.asarray(_IMAGENET_MEAN, dtype=np.float32)) / np.asarray(_IMAGENET_STD, dtype=np.float32)
         return torch.from_numpy(array.transpose(2, 0, 1).copy())
 
     def transform(self, inputs: Sequence[Any]) -> np.ndarray:
@@ -226,25 +244,56 @@ class ResNet152Encoder:
                         raise ValueError(f"Invalid image at row {start + offset}: {exc}") from exc
                 encoded = self._model(torch.stack(batch).to(self._resolved_device))
                 if tuple(encoded.shape) != (len(batch), self.output_dim):
-                    raise ValueError(f"ResNet152 returned unexpected shape {tuple(encoded.shape)}")
+                    raise ValueError(f"{self.display_name} returned unexpected shape {tuple(encoded.shape)}")
                 outputs.append(encoded.detach().cpu().numpy().astype(np.float32, copy=False))
         return np.concatenate(outputs, axis=0)
 
     def spec(self) -> dict:
         """Return provenance without loading a network or accessing the network."""
         return {
-            "encoder": "resnet152", "output_dim": self.output_dim, "frozen": True,
+            "encoder": self.encoder_name, "output_dim": self.output_dim, "frozen": True,
             "loaded": self._model is not None,
             "fingerprint": "sha256:" + self._source["sha256"] if self._source is not None else None,
             "source": dict(self._source) if self._source is not None else None,
             "requested_weights_path": str(self.weights_path) if self.weights_path is not None else None,
-            "requested_weights": "ResNet152_Weights.IMAGENET1K_V1" if self.weights_path is None else "local_state_dict",
+            "requested_weights": self.weights_name if self.weights_path is None else "local_state_dict",
             "cache_dir": str(self.cache_dir),
             **_runtime_spec(self.device, self._resolved_device, self._gpu_ids, self.batch_size),
             "preprocessing": {"color": "RGB", "resize": [224, 224], "interpolation": "bilinear",
-                              "scale": "divide_by_255", "mean": list(_IMAGENET_MEAN),
-                              "std": list(_IMAGENET_STD), "augmentation": False},
+                              "scale": "divide_by_255", "mean": list(_IMAGENET_MEAN) if self.normalize_image else None,
+                              "std": list(_IMAGENET_STD) if self.normalize_image else None, "augmentation": False},
         }
+
+
+class ResNet18Encoder(ResNet152Encoder):
+    """Senior notebook image branch: frozen ImageNet V1 ResNet18, 512 values.
+
+    The notebook uses PIL RGB images, Resize((224, 224)) and ToTensor without
+    ImageNet mean/std normalization. This intentionally preserves that recipe.
+    Weight validation, lazy loading and multi-GPU execution match ResNet152.
+    """
+
+    output_dim = 512
+    encoder_name = "resnet18"
+    display_name = "ResNet18"
+    checkpoint_filename = "resnet18-f37072fd.pth"
+    checkpoint_sha256_prefix = "f37072fd"
+    weights_url = "https://download.pytorch.org/models/resnet18-f37072fd.pth"
+    weights_name = "ResNet18_Weights.IMAGENET1K_V1"
+    normalize_image = False
+
+    @staticmethod
+    def _build_model():
+        return _resnet18_uninitialized()
+
+
+def image_encoder_class(name):
+    """Resolve a configured image encoder without loading weights or CUDA."""
+    if name == "resnet152":
+        return ResNet152Encoder
+    if name == "resnet18":
+        return ResNet18Encoder
+    raise ValueError("image encoder must be resnet152 or resnet18")
 
 
 class MBERTEncoder:

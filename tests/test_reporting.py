@@ -38,50 +38,76 @@ def synthetic_inputs():
               "modalities": {"image": True}}
     provenance = {"run_name": "synthetic_check", "created_at": "2026-01-01T00:00:00Z",
                   "minimum_cfp_visits_per_eye": 3,
-                  "model_origin": "paper_reimplementation", "model_info": {"source": "SYNTHETIC"},
+                  "model_origin": "SYNTHETIC fixed diagnosis detector", "model_info": {
+                      "implementation": "SYNTHETIC fixed diagnosis detector",
+                      "config": {"image_encoder": "resnet152", "n_estimators": 500,
+                                 "max_depth": 6, "learning_rate": .05, "subsample": .8,
+                                 "colsample_bytree": .8, "reg_lambda": 1., "reg_alpha": 0.,
+                                 "tree_method": "gpu_hist", "random_state": 42},
+                      "encoder_specs": {"image": {
+                          "encoder": "resnet152", "output_dim": 2048, "frozen": True,
+                          "source": {"kind": "torchvision", "weights": "ResNet152_Weights.IMAGENET1K_V1",
+                                     "sha256": "394f9c45" + "0" * 56},
+                          "preprocessing": {"color": "RGB", "resize": [224, 224], "interpolation": "bilinear",
+                                            "scale": "divide_by_255", "mean": [.485, .456, .406],
+                                            "std": [.229, .224, .225]}}}},
                   "validation_design": "retrospective_fixed_detector_unverified_external"}
     records = [{"eye_id": "p{}_OD".format(i), "patient_id": "p{}".format(i),
                 "times": [0, .5, 2], "scores": [.2 + i * .05, .3 + i * .05, .4 + i * .05]} for i in range(1, 7)]
     return evaluation, cohort, provenance, records
 
 
-def synthetic_internal_inputs():
-    evaluation, cohort, provenance, records = synthetic_inputs()
-    evaluation["config"]["inner_splits"] = 2
-    provenance.update(validation_design="internal_nested_patient_cv",
-                      model_origin="GlaBoost architecture adapted to GRAPE progression",
-                      score_definition="Endpoint-specific visit evidence learned from eye-level retrospective "
-                                       "progression labels; not glaucoma diagnosis or prospectively calibrated risk")
-    # Deliberately shuffled, with different folds and labels. Selection must use
-    # identifiers only and show each endpoint rather than six instances of PLR2.
-    records = [dict(record, endpoint=ep, fold=i % 3, labels={ep: i % 2})
-               for ep in reversed(ENDPOINTS) for i, record in enumerate(reversed(records))]
-    return evaluation, cohort, provenance, records
-
-
 class SummaryTests(unittest.TestCase):
+    def test_fixed_detector_summary_and_methods_use_saved_configuration(self):
+        evaluation, cohort, provenance, records = synthetic_inputs()
+        provenance["validation_design"] = "external_fixed_detector"
+        for text in (_summary(evaluation, cohort, provenance, False),
+                     str(_report_blocks(evaluation, cohort, provenance, records, synthetic=True))):
+            for expected in ("frozen ImageNet ResNet152", "2,048 output features", "500 trees",
+                             "maximum depth 6", "learning rate 0.05", "row subsampling 0.8",
+                             "column subsampling 0.8", "ImageNet mean/std normalization"):
+                self.assertIn(expected, text)
+            self.assertNotIn("100 trees", text)
+
+    def test_actual_nondefault_tree_settings_are_not_replaced_with_defaults(self):
+        evaluation, cohort, provenance, _ = synthetic_inputs()
+        provenance["model_info"]["config"].update(n_estimators=37, max_depth=2, learning_rate=.01,
+                                                  subsample=.7, colsample_bytree=.6)
+        text = _summary(evaluation, cohort, provenance, False)
+        for expected in ("37 trees", "maximum depth 2", "learning rate 0.01",
+                         "row subsampling 0.7", "column subsampling 0.6"):
+            self.assertIn(expected, text)
+        self.assertNotIn("500 trees", text)
+
+    def test_custom_checkpoint_hash_does_not_establish_imagenet_origin(self):
+        evaluation, cohort, provenance, _ = synthetic_inputs()
+        spec = provenance["model_info"]["encoder_specs"]["image"]
+        spec["source"].update(kind="local_checkpoint", weights=None)
+        spec["preprocessing"].update(mean=None, std=None)
+        text = _summary(evaluation, cohort, provenance, False)
+        self.assertIn("frozen ResNet152", text)
+        self.assertIn("no mean/std normalization", text)
+        self.assertIn("not established by the checkpoint hash alone", text)
+        self.assertNotIn("ImageNet", text)
+
+    def test_missing_model_metadata_does_not_invent_a_recipe(self):
+        evaluation, cohort, provenance, _ = synthetic_inputs()
+        provenance["model_info"] = {}
+        text = _summary(evaluation, cohort, provenance, False)
+        self.assertIn("not recorded", text)
+        self.assertNotIn("ResNet152", text)
+        self.assertNotIn("100 trees", text)
+        self.assertNotIn("500 trees", text)
+
     def test_gpu_methods_disclose_solver_and_random_generator_changes(self):
-        evaluation, cohort, provenance, records = synthetic_internal_inputs()
+        evaluation, cohort, provenance, records = synthetic_inputs()
         evaluation["config"].update(logistic_solver="torch_newton", gpu_device_ids=[0, 1],
-                                    base_model_config={"tree_method": "gpu_hist"},
                                     endpoint_compute_devices={"plr2": "cuda:0", "plr3": "cuda:1", "md_slope": "cuda:0"})
         text = str(_report_blocks(evaluation, cohort, provenance, records, synthetic=True))
-        for phrase in ("GPU histogram", "GPU prediction", "GPU damped-Newton", "intercept in the L2 penalty",
+        for phrase in ("gpu_hist", "GPU damped-Newton", "intercept in the L2 penalty",
                        "draws differ", "NumPy PCG64", "one endpoint at a time per device"):
             self.assertIn(phrase, text)
-        self.assertNotIn("CPU histogram", text)
         self.assertNotIn("the liblinear solver,", text)
-
-    def test_internal_summary_describes_whole_pipeline_and_weak_labels(self):
-        evaluation, cohort, provenance, _ = synthetic_internal_inputs()
-        text = _summary(evaluation, cohort, provenance, False)
-        self.assertIn("retrospective internal validation", text)
-        self.assertIn("nested patient-grouped cross-validation", text)
-        self.assertIn("separate visit model", text)
-        self.assertIn("not labels of disease state at an individual visit", text)
-        self.assertNotIn("fixed detector", text)
-        self.assertNotIn("external", text.lower())
-        self.assertIn("conditional on the fitted out-of-fold", text)
 
     def test_inconclusive_positive_point_estimates_are_not_called_improvement(self):
         evaluation, cohort, provenance, _ = synthetic_inputs()
@@ -133,52 +159,32 @@ class SummaryTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
-    def test_internal_report_has_correct_training_target_and_no_missing_weight_claim(self):
-        inputs = synthetic_internal_inputs()
-        with tempfile.TemporaryDirectory(prefix="glaboost_synthetic_internal_report_") as temp:
-            root = Path(temp)
-            path = write_report(root, *inputs, synthetic=True)
-            report = (root / "report.md").read_text()
-            self.assertEqual(path.read_text().count("data:image/png;base64,"), 2)
-            for text in ("Retrospective internal validation", "weak supervision", "2,048", "100 trees",
-                         "inner out-of-fold summaries", "trained on all eligible training visits",
-                         "one positive patient", "each training eye equal total weight", "inner_splits",
-                         "not an external validation", "Outer fold", "nor prospectively calibrated risks"):
-                self.assertIn(text, report)
-            self.assertNotIn("PROVISIONAL", report)
-            self.assertNotIn("The fixed diagnosis detector", report)
-            self.assertNotIn("Enabled in fixed detector", report)
-            self.assertNotIn("independence from GRAPE requires", report)
-            saved = json.loads((root / "provenance.json").read_text())
-            self.assertEqual(saved["validation_design"], "internal_nested_patient_cv")
-            self.assertTrue(saved["synthetic"])
-            figure = (root / "figures" / "score_trajectories.svg").read_text()
-            self.assertIn("Visit-level progression evidence", figure)
-            self.assertNotIn("Visit-level diagnosis score", figure)
+    def test_unknown_report_design_is_rejected_before_writing_files(self):
+        evaluation, cohort, provenance, records = synthetic_inputs()
+        provenance["validation_design"] = "obsolete_grape_training"
+        with tempfile.TemporaryDirectory(prefix="glaboost_invalid_report_") as temp:
+            with self.assertRaisesRegex(ValueError, "fixed-detector validation provenance"):
+                write_report(Path(temp), evaluation, cohort, provenance, records, synthetic=True)
+            self.assertEqual(list(Path(temp).iterdir()), [])
 
-    def test_internal_trajectories_select_two_eyes_per_endpoint_without_outcomes(self):
-        records = synthetic_internal_inputs()[3]
-        chosen = _selected_eyes(records, internal=True)
-        self.assertEqual([(row["endpoint"], row["eye_id"]) for row in chosen],
-                         [(ep, eye) for ep in ENDPOINTS for eye in ("p1_OD", "p2_OD")])
+    def test_trajectories_select_eyes_by_id_without_outcomes(self):
+        records = synthetic_inputs()[3]
+        chosen = _selected_eyes(records)
         changed = [dict(row, labels={ep: 1 for ep in ENDPOINTS}, scores=list(reversed(row["scores"])))
                    for row in reversed(records)]
-        self.assertEqual([(row["endpoint"], row["eye_id"]) for row in _selected_eyes(changed, internal=True)],
-                         [(row["endpoint"], row["eye_id"]) for row in chosen])
+        self.assertEqual([row["eye_id"] for row in _selected_eyes(changed)],
+                         [row["eye_id"] for row in chosen])
 
-    def test_internal_figure_columns_identify_endpoint_and_use_only_held_out_record_scores(self):
+    def test_trajectory_figure_uses_fixed_detector_scores_and_actual_times(self):
         import matplotlib.pyplot as plt
-        records = synthetic_internal_inputs()[3]
-        fig = _trajectory_figure(records, synthetic=True, internal=True)
+        records = synthetic_inputs()[3]
+        fig = _trajectory_figure(records, synthetic=True)
         try:
-            for column, ep in enumerate(ENDPOINTS):
-                selected = [row for row in _selected_eyes(records, internal=True) if row["endpoint"] == ep]
-                for row, record in enumerate(selected):
-                    ax = fig.axes[row * 3 + column]
-                    self.assertIn("Outer fold {}".format(record["fold"]), ax.get_title(loc="left"))
-                    self.assertEqual(list(ax.lines[0].get_xdata()), record["times"])
-                    self.assertEqual(list(ax.lines[0].get_ydata()), record["scores"])
-                    self.assertEqual(ax.get_ylim(), (0, 1))
+            for ax, record in zip(fig.axes, _selected_eyes(records)):
+                self.assertIn(record["eye_id"], ax.get_title(loc="left"))
+                self.assertEqual(list(ax.lines[0].get_xdata()), record["times"])
+                self.assertEqual(list(ax.lines[0].get_ydata()), record["scores"])
+                self.assertEqual(ax.get_ylim(), (0, 1))
         finally:
             plt.close(fig)
 
