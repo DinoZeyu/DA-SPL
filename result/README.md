@@ -9,6 +9,9 @@ The completed analysis uses two short report-directory names:
 - [hf_training](hf_training/report.html): source diagnosis training and test results.
 - [grape_validation](grape_validation/report.html): longitudinal A/B comparisons on GRAPE.
 
+The GRAPE overview opens with the professor's cohort-level template filled from the
+prespecified primary analysis, followed by all configuration comparisons and detailed reports.
+
 The saved provenance retains the original run identifiers and execution paths;
 the corresponding model artifacts keep those identifiers on scratch.
 
@@ -32,7 +35,8 @@ not the authors' model weights or a claim to their reported accuracy.
 | File or directory | Purpose |
 |---|---|
 | `<run>_source/` | Source-training configuration, held-out diagnosis metrics and overlap/provenance summary |
-| `<run>/report.html`, `report.md` | All configurations, with the primary model specified in advance |
+| `<run>/report.html` | Standalone overview: all configurations, embedded detailed reports, figures, metric tables and audit records |
+| `<run>/report.md` | Markdown overview with links to companion files |
 | `<run>/<model-name>/report.html` | Standalone cohort report with embedded figures |
 | Configuration CSV/JSON files | Metrics, scores, OOF predictions, cohort, exclusions, provenance and folds |
 | Configuration `figures/` | Three-endpoint paired comparison and descriptive score histories |

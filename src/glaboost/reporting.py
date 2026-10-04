@@ -7,10 +7,14 @@ embeds its figures so the report can be shared without its companion directory.
 import base64
 from collections import Counter
 import csv
+import hashlib
 import html
 import json
 import math
+import os
 from pathlib import Path
+import re
+from urllib.parse import unquote, urlsplit
 
 
 ENDPOINTS = ("plr2", "plr3", "md_slope")
@@ -18,6 +22,83 @@ ENDPOINT_NAMES = {"plr2": "PLR2", "plr3": "PLR3", "md_slope": "MD slope"}
 METRICS = ("balanced_accuracy", "auroc", "auprc", "sensitivity", "specificity", "f1")
 METHOD_NAMES = {"latest": "Latest visit", "longitudinal": "Longitudinal integration"}
 BLUE, ORANGE = "#0072B2", "#E69F00"
+
+
+def embed_report_links(report_path):
+    """Bundle this project's generated HTML/CSV/JSON links into one offline page.
+
+    Child HTML already embeds its figures. Only the overview's presentation is
+    rewritten; linked files, numeric records and archived code stay unchanged.
+    Repeated calls can add a source report without duplicating existing sections.
+    """
+    report_path = Path(report_path).resolve()
+    page = report_path.read_text(encoding="utf-8")
+    anchor = re.compile(r'(<a\b[^>]*\bhref=)([\"\x27])([^\"\x27]+)\2', re.IGNORECASE)
+    body = re.compile(r'<body\b[^>]*>(.*?)</body>', re.IGNORECASE | re.DOTALL)
+    if not body.search(page):
+        raise ValueError(f"Generated report has no HTML body: {report_path}")
+    existing_ids = set(re.findall(r'\bid=[\"\x27]([^\"\x27]+)[\"\x27]', page))
+    visited = {report_path: "report-top"}
+    sections = []
+
+    def rewrite(content, directory):
+        def replace(match):
+            href = html.unescape(match[3])
+            url = urlsplit(href)
+            if url.scheme or url.netloc or not url.path:
+                return match[0]
+            target = (directory / unquote(url.path)).resolve()
+            if target.suffix.lower() not in (".html", ".csv", ".json"):
+                return match[0]
+            relative = os.path.relpath(target, report_path.parent)
+            section_id = visited.get(target)
+            if section_id is None:
+                section_id = "attachment-" + hashlib.sha256(relative.encode()).hexdigest()[:16]
+                visited[target] = section_id  # Register before following any backlinks.
+                if section_id not in existing_ids:
+                    raw = target.read_text(encoding="utf-8")
+                    if target.suffix.lower() == ".html":
+                        child = body.search(raw)
+                        if child is None:
+                            raise ValueError(f"Generated report has no HTML body: {target}")
+                        embedded = rewrite(child[1], target.parent)
+                    elif target.suffix.lower() == ".csv":
+                        with target.open(newline="", encoding="utf-8") as stream:
+                            rows = list(csv.reader(stream))
+                        rendered = []
+                        for index, row in enumerate(rows):
+                            tag = "th" if index == 0 else "td"
+                            rendered.append("<tr>" + "".join(
+                                f"<{tag}>{html.escape(cell)}</{tag}>" for cell in row) + "</tr>")
+                        embedded = '<div class="attachment-data"><table>' + "".join(rendered) + "</table></div>"
+                    else:
+                        embedded = '<pre class="attachment-data">' + html.escape(raw) + "</pre>"
+                    sections.append(
+                        f'<section class="report-attachment" id="{section_id}">'
+                        f'<h2>{html.escape(relative)}</h2><p><a href="#report-top">Back to overview</a></p>'
+                        + embedded + "</section>")
+            return match[1] + match[2] + "#" + section_id + match[2]
+        return anchor.sub(replace, content)
+
+    page = rewrite(page, report_path.parent)
+    if "report-top" not in existing_ids:
+        page = re.sub(r'(<body\b[^>]*>)', r'\1<div id="report-top"></div>', page, count=1)
+    if "portable-report-style" not in existing_ids:
+        page = page.replace("</body>", '<style id="portable-report-style">'
+            '.report-attachment{margin-top:48px;padding-top:20px;border-top:2px solid #ccd5df}'
+            '.report-attachment h2{overflow-wrap:anywhere}.report-attachment img{max-width:100%;height:auto}'
+            '.report-attachment figure{margin:24px 0}.report-attachment .table-wrap{overflow-x:auto}'
+            '.report-attachment pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:16px;background:#eef2f5}'
+            '.attachment-data{max-height:32rem;overflow:auto}'
+            '@media print{.attachment-data{max-height:none;overflow:visible}}'
+            '</style></body>', 1)
+    if "portable-report-note" not in existing_ids:
+        page = re.sub(r'(</h1>)', r'\1<p id="portable-report-note">'
+            'This single HTML includes the linked reports, figures, numeric tables and audit records. '
+            'Links below jump to sections within this page; no companion files are needed to view them.</p>',
+            page, count=1)
+    page = page.replace("</body>", "\n".join(sections) + "</body>", 1)
+    report_path.write_text(page, encoding="utf-8")
 
 
 def _clean(value):
@@ -187,6 +268,66 @@ def _summary(evaluation, cohort, provenance, synthetic):
         "The confidence intervals are patient-cluster bootstrap intervals conditional on the fitted out-of-fold "
         "predictions; they do not include uncertainty from refitting the cross-validation pipeline. "
         "This assessment concerns progression during the observed follow-up period, not prediction of future progression."
+    )
+
+
+def cohort_template_summary(evaluation, cohort, provenance, synthetic=False):
+    """Fill the professor's narrative from saved results without assuming benefit."""
+    external = _external_design(provenance)
+    text = "SYNTHETIC TEST DATA — SOFTWARE CHECK ONLY. " if synthetic else ""
+    text += (
+        "We conducted a focused retrospective evaluation on the publicly available GRAPE longitudinal "
+        "glaucoma cohort using a fixed image-only GlaBoost-style detector. "
+    )
+    text += ("Detector training was independent of GRAPE according to the recorded provenance. " if external else
+             "Independence of detector training from GRAPE has not been established. ")
+    text += (
+        "The progression mappings were trained and patient-cross-validated within GRAPE. "
+        "Of {} source eyes, {} eyes from {} patients met prespecified eligibility criteria, providing {} "
+        "evaluable visits, a median of {} visits per eye and a median follow-up of {} months between the first "
+        "and last eligible fundus photographs. Progression was evaluated separately using GRAPE's three "
+        "prespecified visual-field criteria (PLR2, PLR3, and MD slope). The fixed detector was applied "
+        "independently at each eligible visit, and its outputs were integrated using prespecified latest "
+        "score, change, slope, mean, and persistence summaries, without a persistent longitudinal "
+        "representation or reasoning model. "
+    ).format(_count(cohort.get("source", {}).get("n_eyes")), _count(cohort.get("n_eyes")),
+             _count(cohort.get("n_patients")), _count(cohort.get("n_visits")),
+             _number(cohort.get("visits_per_eye", {}).get("median"), 1),
+             _number(cohort.get("followup_months", {}).get("median"), 1))
+    deltas = []
+    for endpoint in ENDPOINTS:
+        result = evaluation.get("endpoints", {}).get(endpoint, {})
+        if result.get("status") != "ok":
+            text += f"{ENDPOINT_NAMES[endpoint]} was not estimable: {result.get('reason', 'no valid evaluation')}. "
+            continue
+        metrics = result["metrics"]
+        delta = result["delta_balanced_accuracy"]
+        percent = lambda value, signed=False: _number(100 * value if value is not None else None, 1, signed)
+        difference = percent(delta.get("estimate"), True)
+        interval = (f"{percent(delta['ci_low'], True)} to {percent(delta['ci_high'], True)}"
+                    if delta.get("ci_low") is not None and delta.get("ci_high") is not None else "not estimable")
+        text += (
+            f"For {ENDPOINT_NAMES[endpoint]}, balanced accuracy changed from "
+            f"{percent(metrics['latest']['balanced_accuracy'].get('estimate'))}% with the latest visit alone to "
+            f"{percent(metrics['longitudinal']['balanced_accuracy'].get('estimate'))}% with longitudinal integration "
+            f"(Δ = {difference} percentage points, 95% CI {interval}). "
+        )
+        deltas.append(delta)
+    if len(deltas) == 3 and all(d.get("estimate") is not None and d["estimate"] > 0 for d in deltas):
+        text += "Point estimates favored longitudinal integration across all three progression definitions. "
+    if len(deltas) == 3 and all(d.get("ci_low") is not None and d.get("ci_high") is not None
+                                and d["ci_low"] <= 0 <= d["ci_high"] for d in deltas):
+        text += "However, all three paired 95% confidence intervals included zero; a consistent benefit has not been established. "
+    elif len(deltas) == 3 and all(d.get("ci_low") is not None and d["ci_low"] > 0 for d in deltas):
+        text += "The paired intervals were above zero for all three endpoints, supporting higher balanced accuracy within this analysis. "
+    else:
+        text += "The results do not establish a consistent gain across all three progression definitions. "
+    return text + (
+        "Intervals used paired patient-cluster bootstrap conditional on fixed out-of-fold predictions, "
+        "without refitting uncertainty or multiple-comparison adjustment. These results concern retrospective "
+        "progression assessment, not future prediction or independent external validation of the complete "
+        "progression pipeline. The central UG3 challenge remains unresolved: transforming episodic AI evidence "
+        "into persistent, traceable, uncertainty-aware longitudinal clinical intelligence."
     )
 
 

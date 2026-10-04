@@ -177,6 +177,12 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(saved_plan["models"][1]["model_config"]["n_estimators"], 3)
         self.assertIn("not independent external validation", (report / "report.md").read_text())
         self.assertIn("primary/report.html", (report / "report.html").read_text())
+        for filename in ("report.html", "report.md"):
+            summary_page = (report / filename).read_text()
+            self.assertLess(summary_page.index("Cohort-level summary"), summary_page.index("Fixed detector settings"))
+            self.assertIn("Prespecified primary configuration: primary.", summary_page)
+            self.assertIn("SYNTHETIC TEST DATA — SOFTWARE CHECK ONLY.", summary_page)
+            self.assertIn("patient-cross-validated within GRAPE", summary_page)
         audit = json.loads((report / "comparison_audit.json").read_text())
         self.assertTrue(audit["comparability_verified"])
         manifest = json.loads((report / "code/manifest.json").read_text())["sha256"]

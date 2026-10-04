@@ -30,6 +30,7 @@ from .external import _snapshot_code, run_external_validation
 from .hf_data import load_hf_diagnosis
 from .longitudinal import EvaluationConfig, _metrics
 from .model import GlaBoost
+from .reporting import embed_report_links
 from .study import (_environment_info, _json_write, _read_json, _refresh_result_index,
                     ensure_outside_raw, sha256_file)
 
@@ -385,14 +386,16 @@ def run_hf_grape(*, training_plan_path, run_name,
                     grape_root=grape, result_dir=output, artifact_dir=artifacts, device=device, cache_dir=cache,
                     image_weights=str(checkpoint), image_batch_size=image_batch_size,
                     allow_download=allow_download, synthetic=synthetic)
-        # Keep the two reports navigable without mixing diagnostic and
-        # progression metrics or copying model artifacts into home.
+        # Include source evidence in the portable overview while keeping
+        # diagnostic and progression metrics in separate sections.
         source_link = f"../{source_report.name}/report.html"
         page_path = report / "report.html"
         page = page_path.read_text(encoding="utf-8")
-        page_path.write_text(page.replace("</body></html>",
+        insertion = '<section class="report-attachment"' if '<section class="report-attachment"' in page else "</body>"
+        page_path.write_text(page.replace(insertion,
             f"<p><a href='{html.escape(source_link, quote=True)}'>Source diagnosis training, "
-            "held-out metrics and duplicate exclusions</a></p></body></html>"), encoding="utf-8")
+            "held-out metrics and duplicate exclusions</a></p>" + insertion, 1), encoding="utf-8")
+        embed_report_links(page_path)
         with (report / "report.md").open("a", encoding="utf-8") as handle:
             handle.write(f"\n[Source diagnosis training, held-out metrics and duplicate exclusions]({source_link})\n")
         status.update(status="complete", stage="complete", grape_report=str(report))

@@ -202,7 +202,7 @@ def _metric(row, prefix, signed=False):
     return f"{value} [{format(100 * low, fmt)}, {format(100 * high, fmt)}]"
 
 
-def _write_summary(report, plan, rows, supplementary, cohort):
+def _write_summary(report, plan, rows, supplementary, cohort, primary_summary=None):
     from .reporting import _write_csv
 
     _write_csv(report / "comparison.csv", rows, ("model", "role", "endpoint"))
@@ -230,7 +230,12 @@ def _write_summary(report, plan, rows, supplementary, cohort):
              "AUROC, AUPRC, sensitivity, specificity and F1 are included in supplementary_metrics.csv. "
              "Each detector report includes cohort accounting, paired metrics, confidence intervals, exclusions, "
              "score trajectories and the cohort-level narrative.")
-    markdown = [f"# {title}", "", opening, "", _INTERPRETATION, "", "## Fixed detector settings", "",
+    summary_heading = "Cohort-level summary — professor's template (primary analysis)"
+    summary_note = f"Prespecified primary configuration: {plan['primary_model']}."
+    markdown = [f"# {title}", ""]
+    if primary_summary:
+        markdown += [f"## {summary_heading}", "", summary_note, "", primary_summary, ""]
+    markdown += [opening, "", _INTERPRETATION, "", "## Fixed detector settings", "",
                 "| " + " | ".join(setting_headings) + " |", "|" + "---|" * len(setting_headings)]
     markdown.extend("| " + " | ".join(map(str, row)) + " |" for row in setting_cells)
     markdown += ["", "These are the settings recorded in each supplied, already trained model artifact; "
@@ -242,6 +247,8 @@ def _write_summary(report, plan, rows, supplementary, cohort):
                  "[Code/environment checksums](code/manifest.json)", "", "Full detector reports:", ""]
     markdown.extend(f"- [{name}]({path})" for name, path in links)
     esc = lambda value: html.escape(str(value), quote=True)
+    summary_html = (f"<section id='cohort-template-summary'><h2>{esc(summary_heading)}</h2>"
+                    f"<p>{esc(summary_note)}</p><p>{esc(primary_summary)}</p></section>" if primary_summary else "")
     table = "<table><thead><tr>" + "".join(f"<th>{esc(c)}</th>" for c in headings) + "</tr></thead><tbody>"
     table += "".join("<tr>" + "".join(f"<td>{esc(c)}</td>" for c in row) + "</tr>" for row in cells) + "</tbody></table>"
     setting_table = "<table><thead><tr>" + "".join(f"<th>{esc(c)}</th>" for c in setting_headings) + "</tr></thead><tbody>"
@@ -250,7 +257,7 @@ def _write_summary(report, plan, rows, supplementary, cohort):
             f"<title>{esc(title)}</title><style>body{{font:16px/1.5 system-ui,sans-serif;max-width:1400px;margin:32px auto;padding:0 20px}}"
             "table{border-collapse:collapse;font-size:14px;width:100%}th,td{border:1px solid #ccd5df;padding:8px;text-align:left}"
             "th{background:#edf2f7}.table{overflow:auto}</style><body>"
-            f"<h1>{esc(title)}</h1><p>{esc(opening)}</p><p>{esc(_INTERPRETATION)}</p>"
+            f"<h1>{esc(title)}</h1>{summary_html}<p>{esc(opening)}</p><p>{esc(_INTERPRETATION)}</p>"
             f"<h2>Fixed detector settings</h2><div class='table'>{setting_table}</div>"
             "<p>Settings come from the supplied, already trained artifacts; detectors are not refitted on GRAPE.</p>"
             f"<h2>Paired progression results</h2><div class='table'>{table}</div><p>{esc(notes)}</p>"
@@ -267,7 +274,7 @@ def run_external_validation(*, plan_path, run_name, grape_root="data/raw/grape",
                             artifact_dir="artifacts", device="cuda", cache_dir=".cache/glaboost",
                             image_weights=None, image_batch_size=None, allow_download=False, synthetic=False):
     """Validate all declared fixed detectors, then publish their paired A/B reports."""
-    from .reporting import _primary_rows, _supplementary_rows
+    from .reporting import _primary_rows, _supplementary_rows, cohort_template_summary, embed_report_links
 
     if not isinstance(run_name, str) or _NAME.fullmatch(run_name) is None:
         raise ValueError("run_name must be 1–80 safe filename characters, starting alphanumeric.")
@@ -411,7 +418,9 @@ def run_external_validation(*, plan_path, run_name, grape_root="data/raw/grape",
                  "detector_independence": "Declared with supplied evidence; not independently established by this software."}
         for directory in (report, artifacts):
             _json_write(directory / "comparison_audit.json", audit)
-        _write_summary(report, plan, rows, supplementary, reference["cohort"])
+        _write_summary(report, plan, rows, supplementary, reference["cohort"],
+                       primary_summary=cohort_template_summary(*primary, synthetic=synthetic))
+        embed_report_links(report / "report.html")
         status.update(status="complete", stage="complete", comparability_verified=True)
         status.pop("current_model", None)
         save_status()

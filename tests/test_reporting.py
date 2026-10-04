@@ -1,6 +1,7 @@
 """Synthetic report checks; no GRAPE training or empirical study results."""
 
 import csv
+from html.parser import HTMLParser
 import json
 from pathlib import Path
 import tempfile
@@ -8,7 +9,8 @@ import unittest
 from unittest.mock import patch
 
 from glaboost.reporting import (ENDPOINTS, METRICS, _clean, _compact_provenance,
-                               _report_blocks, _selected_eyes, _summary, _trajectory_figure, write_report)
+                               _report_blocks, _selected_eyes, _summary, _trajectory_figure,
+                               embed_report_links, write_report)
 
 
 def synthetic_inputs():
@@ -244,6 +246,67 @@ class ReportTests(unittest.TestCase):
             report = (Path(temp) / "report.md").read_text()
             self.assertIn("PLR2 was not estimable: single class", report)
             self.assertNotIn("Point estimates favored", report)
+
+
+class PortableOverviewTests(unittest.TestCase):
+    def test_detached_page_keeps_tables_images_and_cyclic_navigation(self):
+        class Links(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.ids, self.hrefs, self.sources = [], [], []
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if "id" in attrs:
+                    self.ids.append(attrs["id"])
+                if tag == "a":
+                    self.hrefs.append(attrs["href"])
+                if "src" in attrs:
+                    self.sources.append(attrs["src"])
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            child = root / "child"
+            child.mkdir()
+            overview = root / "report.html"
+            overview.write_text('<html><body><h1>Overview</h1><a href="child/report.html">Detail</a>'
+                                '<a href="metrics.csv">Numbers</a></body></html>')
+            (root / "metrics.csv").write_text('label,score\n"<unsafe>, &",0.123456789\n')
+            (child / "report.html").write_text('<html><body><h1>Full narrative</h1>'
+                '<img src="data:image/png;base64,c3ludGhldGlj">'
+                '<a href="../report.html">Overview</a><a href="audit.json">Audit</a></body></html>')
+            (child / "audit.json").write_text('{"text": "<script> &", "estimate": 0.123456789}')
+            embed_report_links(overview)
+            first = overview.read_bytes()
+            embed_report_links(overview)
+            self.assertEqual(overview.read_bytes(), first)
+            # The HF workflow adds source evidence after the initial overview.
+            (root / "source.html").write_text('<html><body>Source evidence<a href="child/report.html">Detail</a></body></html>')
+            overview.write_text(overview.read_text().replace('</body>', '<a href="source.html">Source</a></body>'))
+            embed_report_links(overview)
+            saved = overview.read_text()
+            for path in (root / "metrics.csv", child / "report.html", child / "audit.json", root / "source.html"):
+                path.unlink()
+            links = Links()
+            links.feed(saved)
+            self.assertEqual(len(links.ids), len(set(links.ids)))
+            self.assertTrue(all(href.startswith("#") and href[1:] in links.ids for href in links.hrefs))
+            self.assertEqual(links.sources, ["data:image/png;base64,c3ludGhldGlj"])
+            self.assertEqual(saved.count("Full narrative"), 1)
+            self.assertIn("Source evidence", saved)
+            self.assertIn("0.123456789", saved)
+            self.assertIn("&lt;unsafe&gt;, &amp;", saved)
+            self.assertIn("&lt;script&gt; &amp;", saved)
+            self.assertNotIn("<script>", saved)
+
+    def test_missing_attachment_does_not_replace_original_overview(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report = Path(temp) / "report.html"
+            original = '<html><body><a href="missing.json">Missing audit</a></body></html>'
+            report.write_text(original)
+            with self.assertRaises(FileNotFoundError):
+                embed_report_links(report)
+            self.assertEqual(report.read_text(), original)
 
 
 if __name__ == "__main__":

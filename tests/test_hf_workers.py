@@ -166,7 +166,9 @@ class SourceGPUDispatchTests(unittest.TestCase):
             stack.enter_context(patch("glaboost.hf_training._snapshot_code"))
             stack.enter_context(patch("glaboost.hf_training._environment_info", return_value={"synthetic": True}))
             stack.enter_context(patch("torch.cuda.empty_cache"))
-            source_report = stack.enter_context(patch("glaboost.hf_training._write_source_report"))
+            def source_stub(report, *args):
+                (report / "report.html").write_text("<html><body>SYNTHETIC source stub</body></html>")
+            source_report = stack.enter_context(patch("glaboost.hf_training._write_source_report", side_effect=source_stub))
             external = stack.enter_context(patch("glaboost.hf_training.run_external_validation", side_effect=external_report))
             stack.enter_context(redirect_stdout(io.StringIO()))
             stack.enter_context(redirect_stderr(io.StringIO()))
